@@ -159,9 +159,7 @@ class StructureDataset(torch.utils.data.Dataset):
             exit()
 
         # Load structure and transform into molecule if needed
-        structure = Structure.from_file(structure_path)
-        if not self.periodic:
-            structure = Molecule.from_sites(structure.sites)
+        structure = Structure.from_file(structure_path) if self.periodic else Molecule.from_file(structure_path)
 
         # Get atom features
         atom_fea = np.vstack([self.cai.get_atom_fea(structure[i].specie.number) for i in range(len(structure))])
