@@ -1,3 +1,5 @@
+"""Original Fabric entry point for masked-atom MGT pretraining."""
+
 import os
 import time
 import pathlib
@@ -24,6 +26,7 @@ from lightning.fabric.strategies import FSDPStrategy
 
 
 def pre_train(args, loader, main_model, atom_model, main_optim, atom_optim, criterion, fabric: Fabric):
+    """Run one masked-node reconstruction training epoch and return updated states."""
     main_model.train(), atom_model.train()
     main_optim.zero_grad(), atom_optim.zero_grad()
     epoch_loss = torch.zeros(2).to(fabric.local_rank)
@@ -60,6 +63,7 @@ def pre_train(args, loader, main_model, atom_model, main_optim, atom_optim, crit
 
 
 def validate(args, loader, main_model, atom_model, criterion, fabric):
+    """Evaluate masked-node reconstruction loss and exact-vector accuracy."""
     main_model.eval(), atom_model.eval()
     epoch_loss = torch.zeros(2).to(fabric.local_rank)
     epoch_matches = torch.empty(0).to(fabric.local_rank)
@@ -97,6 +101,7 @@ def validate(args, loader, main_model, atom_model, criterion, fabric):
 
 def main(args):
 
+    """Configure Fabric, datasets, models, optimizers and the pretraining loop."""
     if not osp.exists(args.model_path):
         os.makedirs(args.model_path)
 

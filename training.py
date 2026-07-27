@@ -1,3 +1,5 @@
+"""Original Fabric entry point for supervised MGT training and validation."""
+
 import os
 import time
 import pathlib
@@ -21,6 +23,7 @@ from lightning.fabric.strategies import FSDPStrategy
 
 
 def train(args, model, loader, optimizer, criterion, fabric):
+    """Run one original supervised training epoch with gradient accumulation."""
     model.train()
     optimizer.zero_grad()
     epoch_loss = torch.zeros(2).to(fabric.local_rank)
@@ -49,6 +52,7 @@ def train(args, model, loader, optimizer, criterion, fabric):
 
 
 def validate(args, model, loader, criterion, fabric):
+    """Calculate overall and per-output validation MAE without gradients."""
     model.eval()
     epoch_error = torch.zeros(2).to(fabric.local_rank)
     epoch_indiv_error = [torch.zeros(2).to(fabric.local_rank) for _ in range(args.out_dims)]
@@ -88,6 +92,7 @@ def validate(args, model, loader, criterion, fabric):
 
 def main(args):
 
+    """Configure Fabric, split data, train Graphformer and save checkpoints."""
     if not osp.exists(args.model_path):
         os.makedirs(args.model_path)
 

@@ -1,3 +1,5 @@
+"""Original Fabric entry point for labeled MGT checkpoint evaluation."""
+
 import os
 import time
 import pathlib
@@ -19,6 +21,7 @@ from lightning.fabric.strategies import FSDPStrategy
 
 def test(args, model, loader, criterion, fabric: Fabric):
 
+    """Evaluate one checkpoint and log per-structure absolute errors."""
     test_errors = []
     indiv_errors = []
 
@@ -70,6 +73,7 @@ def test(args, model, loader, criterion, fabric: Fabric):
 
 def main(args):
 
+    """Configure Fabric, load test graphs and restore the requested checkpoint."""
     logger = CSVLogger(
         root_dir=args.save_dir,
         name=args.run_name,

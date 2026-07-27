@@ -1,5 +1,8 @@
+"""Original MGT structure dataset with OpenBind non-periodic compatibility."""
+
 import csv
 import glob
+import hashlib
 import json
 import random
 import warnings
@@ -12,6 +15,7 @@ import dgl
 import torch.utils.data
 from dgl import load_graphs
 from pymatgen.core import Structure, Molecule
+from rdkit import Chem
 
 
 class AtomInitializer(object):
@@ -21,22 +25,27 @@ class AtomInitializer(object):
     !!! Use one AtomInitializer per dataset !!!
     """
     def __init__(self, atom_types):
+        """Initialize this object and its required state."""
         self.atom_types = set(atom_types)
         self._embedding = {}
 
     def get_atom_fea(self, atom_type):
+        """Return the stored feature vector for one atomic number."""
         assert atom_type in self.atom_types
         return self._embedding[atom_type]
 
     def load_state_dict(self, state_dict):
+        """Load atom embeddings and rebuild decoding metadata."""
         self._embedding = state_dict
         self.atom_types = set(self._embedding.keys())
         self._decodedict = {idx: atom_type for atom_type, idx in self._embedding.items()}
 
     def state_dict(self):
+        """Return the atom-embedding mapping for serialization."""
         return self._embedding
 
     def decode(self, idx):
+        """Map an encoded index back to its atom type."""
         if not hasattr(self, '_decodedict'):
             self._decodedict = {idx: atom_type for atom_type, idx in
                                 self._embedding.items()}
@@ -56,6 +65,7 @@ class AtomCustomJSONInitializer(AtomInitializer):
         The path to the .json file
     """
     def __init__(self, elem_embedding_file):
+        """Initialize this object and its required state."""
         with open(elem_embedding_file) as f:
             elem_embedding = json.load(f)
         elem_embedding = {int(float(key)): value for key, value in elem_embedding.items()}
@@ -64,6 +74,45 @@ class AtomCustomJSONInitializer(AtomInitializer):
         super(AtomCustomJSONInitializer, self).__init__(atom_types)
         for key, value in elem_embedding.items():
             self._embedding[key] = np.array(value, dtype=float)
+
+
+def load_nonperiodic_molecule(structure_path):
+    """Load a molecule, with an RDKit fallback for OpenBind ligand PDBs."""
+    try:
+        return Molecule.from_file(structure_path)
+    except (AttributeError, OSError, ValueError):
+        if not str(structure_path).lower().endswith(".pdb"):
+            raise
+        rdkit_molecule = Chem.MolFromPDBFile(
+            str(structure_path), sanitize=True, removeHs=False
+        )
+        if rdkit_molecule is None:
+            raise ValueError(f"RDKit could not parse PDB file: {structure_path}")
+        if rdkit_molecule.GetNumConformers() != 1:
+            raise ValueError(
+                f"PDB must contain exactly one conformer: {structure_path}"
+            )
+        conformer = rdkit_molecule.GetConformer()
+        species = [atom.GetSymbol() for atom in rdkit_molecule.GetAtoms()]
+        coordinates = [
+            list(conformer.GetAtomPosition(index))
+            for index in range(rdkit_molecule.GetNumAtoms())
+        ]
+        return Molecule(species, coordinates)
+
+
+def deterministic_laplacian_pe(graph, dimension, file_id, seed):
+    """Run DGL LapPE with a stable per-structure eigenvector sign choice."""
+    seed_material = f"{seed}:{file_id}".encode("utf-8")
+    local_seed = int.from_bytes(
+        hashlib.sha256(seed_material).digest()[:4], byteorder="big"
+    )
+    numpy_state = np.random.get_state()
+    try:
+        np.random.seed(local_seed)
+        return dgl.lap_pe(graph, dimension, padding=True)
+    finally:
+        np.random.set_state(numpy_state)
 
 
 def compute_bond_cosines(edges):
@@ -87,6 +136,7 @@ class StructureDataset(torch.utils.data.Dataset):
 
     def __init__(self, args, process: bool = False, random_seed: int = 123, transform=None):
         
+        """Initialize this object and its required state."""
         self.root = args.root
         self.random_seed = random_seed
         self.transform = transform
@@ -115,14 +165,17 @@ class StructureDataset(torch.utils.data.Dataset):
             self.id_prop_data = [row for row in reader]
 
     def __len__(self):
+        """Return the number of dataset records."""
         return len(self.id_prop_data)
 
     def shuffle(self):
+        """Shuffle records reproducibly with the dataset seed."""
         random.seed(self.random_seed)
         random.shuffle(self.id_prop_data)
         return
 
     def __getitem__(self, idx):
+        """Load and return one indexed dataset record."""
         cif_id = self.id_prop_data[idx][0]
 
         if self.process:
@@ -142,6 +195,7 @@ class StructureDataset(torch.utils.data.Dataset):
 
     def _construct_graph(self, file_id):
         # Check if file exists and there are no duplicates
+        """Parse one structure and build local, line and Coulomb DGL graphs."""
         if osp.exists(osp.join(self.raw_dir, file_id)):
             structure_path = osp.join(self.raw_dir, file_id)
         elif glob.glob(osp.join(self.raw_dir, f'{file_id}.*')):
@@ -159,7 +213,11 @@ class StructureDataset(torch.utils.data.Dataset):
             exit()
 
         # Load structure and transform into molecule if needed
-        structure = Structure.from_file(structure_path) if self.periodic else Molecule.from_file(structure_path)
+        structure = (
+            Structure.from_file(structure_path)
+            if self.periodic
+            else load_nonperiodic_molecule(structure_path)
+        )
 
         # Get atom features
         atom_fea = np.vstack([self.cai.get_atom_fea(structure[i].specie.number) for i in range(len(structure))])
@@ -220,7 +278,9 @@ class StructureDataset(torch.utils.data.Dataset):
         G.edata['edge_feats'] = edge_fea
         G.edata['r'] = edge_disp
         # Get Positional Encodings
-        G.ndata['pes'] = dgl.lap_pe(G, 10, padding=True)
+        G.ndata['pes'] = deterministic_laplacian_pe(
+            G, self.pe_dim, file_id, self.random_seed
+        )
 
         # Construct Full Graph
         FG = dgl.graph(data=(fc_index[0], fc_index[1]), num_nodes=atom_fea.shape[0])
@@ -234,6 +294,7 @@ class StructureDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def collate_run(samples: List[Tuple[dgl.DGLGraph, dgl.DGLGraph, dgl.DGLGraph, str]]):
+        """Batch unlabeled graph triplets for inference."""
         graphs, line_graphs, full_graphs, labels, ids = map(list, zip(*samples))
         batched_graph = dgl.batch(graphs)
         batched_line_graph = dgl.batch(line_graphs)
@@ -245,6 +306,7 @@ class StructureDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def collate_tt(samples: List[Tuple[dgl.DGLGraph, dgl.DGLGraph, dgl.DGLGraph, torch.Tensor, str]]):
+        """Batch labeled graph triplets, labels and identifiers."""
         graphs, line_graphs, full_graphs, labels, ids = map(list, zip(*samples))
         batched_graph = dgl.batch(graphs)
         batched_line_graph = dgl.batch(line_graphs)
@@ -256,6 +318,7 @@ class StructureDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def collate_pre(samples: List[Tuple[Tuple, dgl.DGLGraph, dgl.DGLGraph, str]]):
+        """Batch masked graphs and retain global masked-node indices."""
         graphs, line_graphs, full_graphs, ids = map(list, zip(*samples))
         graphs, nodes_sub = map(list, zip(*graphs))
         cum_n = 0

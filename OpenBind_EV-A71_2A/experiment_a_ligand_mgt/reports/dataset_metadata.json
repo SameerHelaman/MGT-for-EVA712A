@@ -1,0 +1,64 @@
+{
+  "cleaning_rules": [
+    "experimental_pKD is present",
+    "complex is present in official affinity reference",
+    "covalent is False",
+    "suspected_artefact is False",
+    "pb_valid_ref is True",
+    "metadata SMILES and reference SDF canonical identities agree"
+  ],
+  "coordinate_preservation_tolerance_angstrom": 0.00011,
+  "counts": {
+    "benchmark_compound_groups": 474,
+    "curated_structure_rows": 621,
+    "excluded_structure_rows": 304,
+    "generated_ligand_pdb_files": 621,
+    "source_metadata_rows": 925
+  },
+  "dataset": "OpenBind EV-A71 2A Experiment A",
+  "dataset_version": "1.0",
+  "exclusion_reason_counts": {
+    "absent_from_official_affinity_reference": 276,
+    "covalent_ligand": 2,
+    "missing_experimental_pKD": 276,
+    "reference_pose_fails_posebusters": 28,
+    "suspected_crystallographic_artefact": 39
+  },
+  "label": "experimental_pKD from official benchmark reference",
+  "rdkit_version": "2025.09.5",
+  "representation": "crystallographic ligand-only PDB",
+  "requested_split_proportions": {
+    "test": 0.15,
+    "train": 0.7,
+    "validation": 0.15
+  },
+  "seed": 123,
+  "sha256": {
+    "atom_init": "93d7b2c2381f8dd9a465f4428e2d3fb6f72b3eadf3c6752591e7924b835809cd",
+    "curated_compounds": "2b5240e24d4bf5003c88760c1bd6581972166d29a10f822b9e080a984bed1c89",
+    "curated_structures": "7d3377b4a91d44578d290c88b4b32d739ab94666891bb2f6ef3bd3f16c9e728e",
+    "excluded_records": "a18f865021b39a50975cccdc7acf68b0e85ba505c62c022773e697dfee8f5742",
+    "id_prop": "f35098a13638fad6adb26661d9a1a13c0a842653401401a66f847b4f005e5370",
+    "official_benchmark_reference": "1ff937a952a9e11f9783c9de362b738a96e55e8b06ead2e41828ef90d8538fc8",
+    "random_split": "ec33bcf45c6d11af258b97a8194c2b5647ed3b247bc2cd8db6acb2da904eeb88",
+    "scaffold_split": "524c9bb7a455cd8f9a210a3dae48d40464438e1f092c4f4639ae4241c17753f1",
+    "source_metadata": "389a7edca3ac8034d6533da5a3f3235619e7206aef7284441fd52d350bb1c652",
+    "source_structure_manifest": "caec5a3ef9b842ded2ed08d558275d4587eedb723433501382319553d59751c4"
+  },
+  "source_structure": "ligand_ref.sdf",
+  "split_audit": {
+    "random_compound_leakage_count": 0,
+    "random_counts": {
+      "test": 93,
+      "train": 435,
+      "validation": 93
+    },
+    "scaffold_compound_leakage_count": 0,
+    "scaffold_counts": {
+      "test": 93,
+      "train": 435,
+      "validation": 93
+    },
+    "scaffold_leakage_count": 0
+  }
+}

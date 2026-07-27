@@ -1,3 +1,5 @@
+"""Original DGL transform for self-supervised random atom masking."""
+
 import dgl
 import torch
 import random
@@ -6,6 +8,7 @@ from dgl import BaseTransform
 
 
 class MaskAtom(BaseTransform):
+    """Zero randomly selected node features while retaining their reconstruction labels."""
     def __init__(self, num_atom_fea, mask_rate, node_feat_name):
         """
         Randomly masks an atom, and optionally masks edges connecting to it.
@@ -48,4 +51,5 @@ class MaskAtom(BaseTransform):
         return g, nsg
 
     def __repr__(self):
+        """Return a concise printable transform configuration."""
         return '{}(num_atom_fea={}, mask_rate={})'.format(self.__class__.__name__, self.num_atom_fea, self.mask_rate)

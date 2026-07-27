@@ -1,3 +1,5 @@
+"""Original MGT edge-gated graph convolution and ALIGNN update layers."""
+
 from typing import Tuple, Union
 import dgl
 import numpy
@@ -39,19 +41,23 @@ class EdgeGatedGraphConv(nn.Module):
         """Edge-gated graph convolution.
         h_i^l+1 = ReLU(U h_i + sum_{j->i} eta_{ij} ⊙ V h_j)
         """
+        # Isolate temporary DGL fields so the caller graph is not permanently changed.
         g = g.local_var()
 
+        # Project source and destination node states for the learned edge gate.
         g.ndata["e_src"] = self.src_gate(node_feats)
         g.ndata["e_dst"] = self.dst_gate(node_feats)
         g.apply_edges(fn.u_add_v("e_src", "e_dst", "e_nodes"))
         m = g.edata.pop("e_nodes") + self.edge_gate(edge_feats)
 
+        # Convert each edge channel to a soft gate in the interval (0, 1).
         g.edata["sigma"] = torch.sigmoid(m)
         g.ndata["Bh"] = self.dst_update(node_feats)
         g.update_all(
             fn.u_mul_e("Bh", "sigma", "m"), fn.sum("m", "sum_sigma_h")
         )
         g.update_all(fn.copy_e("sigma", "m"), fn.sum("m", "sum_sigma"))
+        # Normalize gated neighbour messages by total incoming gate strength.
         g.ndata["h"] = g.ndata["sum_sigma_h"] / (g.ndata["sum_sigma"] + 1e-6)
         x = self.src_update(node_feats) + g.ndata.pop("h")
 
@@ -67,6 +73,7 @@ class EdgeGatedGraphConv(nn.Module):
         else:
             y = F.silu(m)
 
+        # Retain previous node/edge states to stabilize deep message passing.
         if self.residual:
             x = node_feats + x
             y = edge_feats + y
@@ -75,17 +82,22 @@ class EdgeGatedGraphConv(nn.Module):
 
 
 class ALIGNNLayer(nn.Module):
+    """Compose a line-graph edge update with an atom-graph update."""
     def __init__(self, feature_dims: int, edge_norm: Union[bool, Tuple[bool, bool]] = True, node_norm: Union[bool, Tuple[bool, bool]] = True):
+        """Initialize this object and its required state."""
         super(ALIGNNLayer, self).__init__()
         if isinstance(edge_norm, bool):
             edge_norm = (edge_norm, edge_norm)
         if isinstance(node_norm, bool):
             node_norm = (node_norm, node_norm)
+        # First update bonds-as-nodes using angles-as-edges on the line graph.
         self.edge_update = EdgeGatedGraphConv(feature_dims=feature_dims, norm=edge_norm)
+        # Then update atoms-as-nodes using the updated bonds on the atom graph.
         self.atom_update = EdgeGatedGraphConv(feature_dims=feature_dims, norm=node_norm)
 
     def forward(self, g: dgl.DGLGraph, lg: dgl.DGLGraph, x: Tensor, y: Tensor, z: Tensor):
         # Convolution on line graph
+        """Apply this module to its input tensors or graphs."""
         y, z = self.edge_update(g=lg, node_feats=y, edge_feats=z)
         # Convolution on atomistic graph
         x, y = self.atom_update(g=g, node_feats=x, edge_feats=y)

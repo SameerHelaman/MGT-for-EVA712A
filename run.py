@@ -1,3 +1,5 @@
+"""Original Fabric entry point for checkpoint inference without labels."""
+
 import os
 import time
 import pathlib
@@ -19,6 +21,7 @@ from lightning.fabric.strategies import FSDPStrategy
 
 def test(args, model, loader, fabric: Fabric):
 
+    """Generate and log predictions for every unlabeled input structure."""
     fabric.print('-------------------- Run Started --------------------')
     model.eval()
     start_time = time.time()
@@ -44,6 +47,7 @@ def test(args, model, loader, fabric: Fabric):
 
 def main(args):
 
+    """Build the dataset/model, restore a checkpoint and launch inference."""
     logger = CSVLogger(
         root_dir=args.save_dir, 
         name=args.run_name,

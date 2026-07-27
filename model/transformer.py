@@ -1,3 +1,5 @@
+"""Original wider-graph multi-head attention used by MGT Graphformer."""
+
 import math
 from typing import Union, Tuple, Optional
 
@@ -10,9 +12,11 @@ from dgl import softmax_edges
 from dgl.nn.functional import edge_softmax
 
 class multiheaded(nn.Module):
+    """Perform original multi-head attention over the wider Coulomb graph."""
     def __init__(self, in_channels: int, out_channels: int, heads: int = 1, 
                  concat: bool = True, dropout: float = 0.2, bias: bool = True, 
                  residual: bool = True, norm: Union[bool, Tuple[bool, bool]] = True):
+        """Initialize this object and its required state."""
         super(multiheaded, self).__init__()
 
         if isinstance(norm, bool):
@@ -20,6 +24,7 @@ class multiheaded(nn.Module):
 
         self.in_channels = in_channels
         self.out_channels = out_channels
+        # Store the number of attention heads and per-head output width.
         self.heads = heads
         self.concat = concat
         self.dropout = dropout
@@ -46,6 +51,7 @@ class multiheaded(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        """Initialize attention projection weights with Xavier initialization."""
         self.lin_query.reset_parameters()
         self.lin_key.reset_parameters()
         self.lin_value.reset_parameters()
@@ -67,6 +73,7 @@ class multiheaded(nn.Module):
                 attention weights for each edge. (default: :obj:`None`)
         """
 
+        # Confine temporary query/key/value/message fields to this forward call.
         g = g.local_var()
 
         g.ndata['query'] = self.lin_query(node_feats).view(-1, self.heads, self.out_channels)
@@ -75,8 +82,15 @@ class multiheaded(nn.Module):
         g.apply_edges(fn.u_mul_v('query', 'key', 'scores'))
         m = g.edata.pop('scores') + self.lin_edge(edge_feats).view(-1, self.heads, self.out_channels)
         
+        # Scale logits by sqrt(head width) to control softmax sharpness.
         scores = m / math.sqrt(self.out_channels)
-        g.edata['alpha'] = F.dropout(edge_softmax(g, scores).sum(dim=-1).unsqueeze(dim=-1), p=self.dropout)
+        # Normalize attention over incoming wider-graph edges and regularize only in training.
+        g.edata['alpha'] = F.dropout(
+            edge_softmax(g, scores).sum(dim=-1).unsqueeze(dim=-1),
+            p=self.dropout,
+            training=self.training,
+        )
+        # Weight source values by attention and sum them at destination atoms.
         g.update_all(fn.u_mul_e('value', 'alpha', 'm'), fn.sum('m', 'h'))
         x = g.ndata.pop('h')
 

@@ -1,3 +1,5 @@
+"""Generate elemental atom-initialization vectors from periodic-table data."""
+
 import json
 import os
 
