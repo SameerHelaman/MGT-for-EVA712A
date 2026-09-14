@@ -658,26 +658,6 @@ They are **not required steps** for the main commands above.
 | [utils/make_atom_init.py](utils/make_atom_init.py), `utils/atomic_properties.xlsx` | Optional elemental-feature generation utility and source workbook. Not needed when using the verified `atom_init.json`. |
 | `__pycache__/`, `*.pyc` | Automatically generated Python caches; not source or data dependencies. |
 
-Do not remove `atom_init.json` or the original neural-network modules just
-because their names come from upstream: the active MGT workflow imports them.
-The old shared `train_openbind_baseline.py` has been replaced by the four
-standalone baseline trainers.
-
-Practical checks:
-
-- Use the stated directory layout. Changing `--data_root` does not change the
-  controlled loader's repository-relative source-SDF location.
-- The preparation code includes checks specific to this release. It is not an
-  arbitrary-dataset importer; retain the expected source files and reference.
-- Stop when a command fails. A missing raw file, unresolved Git LFS pointer or
-  incomplete graph cache must be fixed before training.
-- For a new run in an existing checkout, use new output directories and update
-  all notebook path settings described above. Defaults may contain completed
-  work.
-- Before handing over or uploading the repository, include all active source
-  files and notebooks in the file guide. Generated `output/` files are ignored
-  by Git; provide them separately if the recipient should analyse completed
-  runs without retraining.
 
 ### Sources
 
