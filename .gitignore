@@ -1,5 +1,12 @@
-# Submission script
-*.sh
+# Downloaded and generated project data (recreate using README.md)
+/OpenBind_EV-A71_2A/
+/downloads/
+/examples/example_data/atom_init.json
+
+# Trained model weights and generated graph caches
+*.ckpt
+*.pt
+*.bin
 
 # Byte-compiled / optimized / DLL Files
 __pycache__/
@@ -18,3 +25,15 @@ mgt.p*
 
 # Pycharm folder
 .idea/
+
+# Notebook checkpoints, local copies and retired documentation
+.ipynb_checkpoints/
+*.local.ipynb
+/notebooks/OpenBind_MGT_Visual_Analysis.ipynb
+/README_OLD.md
+
+# Local environments and credentials
+.venv/
+.env
+.env.*
+.DS_Store

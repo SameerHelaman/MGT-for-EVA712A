@@ -1,688 +1,697 @@
-# Molecular Graph Transformer for OpenBind single-target affinity prediction
+# OpenBind ligand-affinity prediction with MGT
 
-This repository adapts the original Molecular Graph Transformer (MGT) implementation to predict experimental **pKD** for crystallographic ligands from the OpenBind EV-A71/CVA16 2A protease release. It contains the original MGT code, a quality-controlled OpenBind dataset pipeline, controlled 2D/3D baselines, the complete original Graphformer, and an atom-masking pretraining experiment.
+This project compares seven molecular models for predicting the binding affinity
+of ligands in the OpenBind EV-A71 2A dataset. It uses Morgan fingerprints,
+molecular graphs and crystallographic ligand geometry, with optional
+atom-feature masking pretraining.
 
-The central scientific question is:
+The target is **experimental pKD**, `pKD = −log10(KD in mol/L)`, not pKa.
+Only ligand information is used; protein coordinates and sequences are not inputs.
 
-> Do learned 2D chemistry, crystallographic distances, bond angles, and full Coulomb-attention MGT components improve ligand-affinity prediction and generalisation to unseen chemical scaffolds?
+This README explains how to install the dependencies, prepare the raw data,
+run the experiments and produce the tables and figures.
 
-The main result is that crystallographic geometry is useful. Without pretraining, the 3D distance GNN gives the strongest scaffold generalisation. With 20% atom-masking pretraining, complete MGT improves substantially and becomes numerically best, although its advantage over the much smaller 3D distance GNN is too small to establish from one seed.
+This is a **code-only repository**. Raw data, prepared datasets, split files,
+trained checkpoints and generated tables/figures are not included. Download
+the source files and run the steps below to recreate them. The three notebooks
+are published without saved outputs; run them after their required preparation
+or training steps.
 
 ## Contents
 
-- [Dataset](#dataset)
-- [Scientific design](#scientific-design)
-- [Models](#models)
-- [Results](#results)
-- [Repository tree and call map](#repository-tree-and-call-map)
-- [Original code and modifications](#original-code-and-modifications)
 - [Installation](#installation)
-- [Reproducing the dataset](#reproducing-the-dataset)
-- [Reproducing the experiments](#reproducing-the-experiments)
+- [Download the project and raw data](#download-the-project-and-raw-data)
+- [Prepare the dataset](#prepare-the-dataset)
+- [Create the splits](#create-the-splits)
+- [Run training and testing](#run-training-and-testing)
+- [Models and training procedure](#models-and-training-procedure)
 - [Output files](#output-files)
-- [Implementation walkthrough](#implementation-walkthrough)
-- [Limitations](#limitations)
-
-## Dataset
-
-The experiments use the OpenBind Structure–Affinity Data Release for EV-A71/CVA16 2A protease. The public release contains 925 crystallographic binding events from 699 compounds, with affinity values available for a subset. Affinity is measured as KD using the Creoptix WAVEsystem and represented here as:
-
-```text
-pKD = -log10(KD in molar units)
-```
-
-This project is a **ligand-only, single-target** experiment. It uses the crystallographic coordinates in each `ligand_ref.sdf`; it does not provide the protein structure or sequence to the model. Predictions therefore represent single-target ligand structure–activity learning, not a target-agnostic physical protein–ligand scoring function.
-
-### Curation rules
-
-A crystallographic record is retained only when:
-
-1. `experimental_pKD` is present.
-2. The complex is present in the official affinity reference.
-3. The ligand is not covalent.
-4. The structure is not marked as a suspected artefact.
-5. The reference pose passes the supplied PoseBusters validity flag.
-6. Metadata and reference-SDF canonical molecular identities agree.
-
-The frozen curated dataset contains:
-
-| Quantity | Count |
-|---|---:|
-| Source metadata rows | 925 |
-| Curated crystallographic ligand structures | 621 |
-| Excluded structures | 304 |
-| Benchmark compound groups | 474 |
-| Train structures | 435 |
-| Validation structures | 93 |
-| Test structures | 93 |
-
-Some compounds have multiple crystallographic structures. Every structure for the same `official_compound_group_id` is assigned to the same partition. Test predictions are reported at both structure level and compound level; compound predictions are the mean across repeated crystal structures.
-
-### Frozen splits
-
-Two 70/15/15 manifests are provided with seed 123:
-
-- Random compound-group split: `splits/random_seed_123.csv`
-- Bemis–Murcko scaffold split: `splits/scaffold_seed_123.csv`
-
-Both have 435/93/93 structures. Compound leakage is zero for both; scaffold leakage is zero for the scaffold split. Checksums and the exact rules are stored in `OpenBind_EV-A71_2A/experiment_a_ligand_mgt/reports/dataset_metadata.json`.
-
-The scaffold split is the primary generalisation test because its test compounds contain scaffolds absent from training. The random split mainly measures interpolation among related chemistry.
-
-## Scientific design
-
-The controlled ablation adds one representation component at a time:
-
-```text
-Morgan fingerprint MLP
-        │ fixed 2D substructure representation
-        ▼
-2D GNN
-        │ learned atom–bond message passing
-        ▼
-Crystallographic 3D distance GNN
-        │ spatial neighbours + distance RBF expansion
-        ▼
-Crystallographic 3D ALIGNN
-        │ line graph + bond-angle cosine RBF expansion
-        ▼
-Complete original MGT Graphformer
-        │ Coulomb graph attention + Laplacian PE
-        │ + ALIGNN + local GNN + FFN/residual/norm
-        ▼
-Masked complete MGT
-          20% atom-feature reconstruction before affinity fine-tuning
-```
-
-Unless noted otherwise, matched experiments use:
-
-- Seed: 123
-- Batch size: 32
-- Optimizer: Adam
-- Learning rate: `1e-4`
-- Weight decay: `1e-5`
-- Loss: Huber, delta 1.0
-- Train-only target normalization
-- Maximum epochs: 200
-- Early-stopping patience: 10
-- Best validation-loss checkpoint for testing
-- Metrics: MAE, MSE, RMSE, R², Pearson r, Spearman r and MAPE
-
-## Models
-
-### Morgan fingerprint MLP
-
-- Morgan fingerprint radius 2, 2048 bits.
-- MLP: `2048 → 128 → 64 → 1`.
-- Batch normalization, ReLU and dropout.
-- No learned graph, coordinates, angles or Coulomb attention.
-- Parameters: 270,977.
-
-Purpose: fixed-representation chemical baseline.
-
-### 2D GNN
-
-- Atoms are nodes.
-- Chemical bonds are edges.
-- 152-dimensional RDKit atom features.
-- 12-dimensional RDKit bond features.
-- Three original `EdgeGatedGraphConv` layers.
-- No coordinates, spatial neighbours, distance RBFs, line graph or Coulomb graph.
-- Parameters: 4,094,849.
-
-Purpose: test whether learned molecular graphs outperform Morgan fingerprints.
-
-### Crystallographic 3D distance GNN
-
-- Same atom and bond chemistry as the 2D GNN.
-- Coordinates loaded from OpenBind `ligand_ref.sdf` crystal poses.
-- Chemical-bond and spatial-neighbour edge union.
-- 5 Å spatial cutoff and up to 32 spatial neighbours per atom.
-- 40-bin distance RBF expansion using the original MGT `RBFExpansion`.
-- Three original `EdgeGatedGraphConv` layers.
-- No line graph, angular ALIGNN processing or Coulomb attention.
-- Parameters: 4,099,969.
-
-Purpose: isolate the value of experimental 3D distances.
-
-### Crystallographic 3D ALIGNN
-
-- Same chemistry, spatial graph and distances as the 3D distance GNN.
-- DGL line graph: local graph edges become line-graph nodes.
-- Bond angles represented by cosine values in `[-1, 1]`.
-- 40-bin angle RBF expansion.
-- Three original `model.alignn.ALIGNNLayer` updates.
-- No Coulomb attention.
-- Parameters: 8,118,529.
-
-Purpose: isolate the value of angular processing beyond distances.
-
-### Complete original MGT Graphformer
-
-Uses `model.graphformer.Graphformer` with:
-
-- Original atom embedding.
-- Local distance graph.
-- Line graph and original ALIGNN updates.
-- Fully connected wider graph with `ZiZj / rij` Coulomb features.
-- Original multi-head graph attention from `model/transformer.py`.
-- Post-ALIGNN `EdgeGatedGraphConv` layers.
-- Two-layer feed-forward block.
-- Encoder residual connection and layer normalization.
-- Deterministic 10-dimensional Laplacian positional encoding.
-- Global average pooling and scalar pKD head.
-- Parameters: 13,702,241.
-
-### Masked-pretrained ALIGNN and MGT
-
-`utils.masker.MaskAtom` zeros 20% of atom feature vectors. The encoder and a temporary linear decoder reconstruct the original atom feature vectors with mean squared error for 30 epochs. Only the training partition is used. The decoder is discarded, and the pretrained encoder is fine-tuned on pKD.
-
-The original `pre-training.py` is Graphformer-specific and applies a sigmoid output before `BCEWithLogitsLoss`, which would apply the sigmoid logic twice. The matched experiment therefore reuses the original `MaskAtom` transform but uses a single, consistent MSE reconstruction objective for both ALIGNN and MGT.
-
-## Results
-
-All values below are compound-level test metrics for seed 123.
-
-### Unmasked model comparison
-
-| Model | Split | MAE ↓ | RMSE ↓ | R² ↑ | Pearson ↑ | Spearman ↑ |
-|---|---|---:|---:|---:|---:|---:|
-| Morgan MLP | Random | 0.416 | 0.534 | 0.523 | 0.732 | 0.619 |
-| 2D GNN | Random | 0.395 | 0.502 | 0.577 | 0.771 | 0.697 |
-| 3D distance GNN | Random | 0.388 | 0.488 | 0.602 | 0.789 | **0.752** |
-| 3D ALIGNN | Random | 0.379 | **0.474** | **0.624** | **0.802** | 0.737 |
-| Complete MGT | Random | **0.367** | 0.479 | 0.616 | 0.787 | 0.693 |
-| Morgan MLP | Scaffold | 0.572 | 0.716 | -0.007 | 0.503 | 0.269 |
-| 2D GNN | Scaffold | 0.519 | 0.674 | 0.110 | 0.489 | 0.307 |
-| **3D distance GNN** | Scaffold | **0.515** | **0.655** | **0.159** | **0.547** | **0.360** |
-| 3D ALIGNN | Scaffold | 0.545 | 0.691 | 0.063 | 0.473 | 0.290 |
-| Complete MGT | Scaffold | 0.578 | 0.757 | -0.125 | 0.354 | 0.132 |
-
-The controlled random progression is:
-
-```text
-Morgan → 2D GNN → 3D distance GNN → 3D ALIGNN
-RMSE  0.534     0.502             0.488       0.474
-```
-
-Distances provide a consistent improvement on both splits. Angles improve random interpolation but overfit unseen scaffolds. Unmasked MGT does not justify its extra capacity on the scaffold test.
-
-### Effect of atom masking
-
-| Model | Split | Masking | MAE ↓ | RMSE ↓ | R² ↑ | Pearson ↑ | Spearman ↑ |
-|---|---|---:|---:|---:|---:|---:|---:|
-| ALIGNN | Random | No | 0.379 | 0.474 | 0.624 | 0.802 | **0.737** |
-| ALIGNN | Random | Yes | **0.377** | **0.467** | **0.635** | **0.805** | 0.726 |
-| MGT | Random | No | **0.367** | 0.479 | 0.616 | 0.787 | **0.693** |
-| MGT | Random | Yes | 0.368 | **0.459** | **0.648** | **0.812** | 0.685 |
-| ALIGNN | Scaffold | No | **0.545** | **0.691** | **0.063** | **0.473** | 0.290 |
-| ALIGNN | Scaffold | Yes | 0.559 | 0.716 | -0.005 | 0.468 | **0.293** |
-| MGT | Scaffold | No | 0.578 | 0.757 | -0.125 | 0.354 | 0.132 |
-| MGT | Scaffold | Yes | **0.513** | **0.651** | **0.170** | **0.526** | **0.354** |
-
-Masking improves MGT substantially, especially on the scaffold split. It does not improve ALIGNN scaffold generalisation.
-
-### Final ranking for scaffold generalisation
-
-| Model | Scaffold RMSE ↓ | Scaffold R² ↑ |
-|---|---:|---:|
-| **Masked complete MGT** | **0.651** | **0.170** |
-| 3D distance GNN | 0.655 | 0.159 |
-| 2D GNN | 0.674 | 0.110 |
-| Unmasked ALIGNN | 0.691 | 0.063 |
-| Masked ALIGNN | 0.716 | -0.005 |
-| Morgan MLP | 0.716 | -0.007 |
-| Unmasked complete MGT | 0.757 | -0.125 |
-
-Masked MGT is numerically best, but the RMSE advantage over the 3D distance GNN is only 0.004 pKD. Multiple seeds and uncertainty estimates are required before claiming a statistically meaningful difference. The distance GNN remains the best efficiency–performance choice.
-
-## Repository tree and call map
-
-Generated `.bin`, `.pt`, `.ckpt`, structure and cache files are abbreviated.
-
-```text
-MGT/
-├── README.md                         # This scientific and reproducibility guide
-├── model/
-│   ├── alignn.py                     # Original ALIGNN and edge-gated graph layers
-│   ├── transformer.py                # Original Coulomb multi-head graph attention
-│   ├── graphformer.py                # Original complete MGT encoder and regressor
-│   ├── ligand_gnn.py                 # Controlled ligand-only 2D GNN
-│   ├── ligand_3d_gnn.py              # Controlled crystallographic distance GNN
-│   └── ligand_3d_alignn.py           # Controlled crystallographic ALIGNN
-├── modules/
-│   └── modules.py                    # Original MLPLayer and RBFExpansion utilities
-├── utils/
-│   ├── datasets.py                   # Original MGT StructureDataset + OpenBind compatibility
-│   ├── masker.py                     # Original random atom-feature masking transform
-│   ├── molecular_features.py         # RDKit atom and bond feature definitions
-│   ├── openbind_ligand_dataset.py    # SDF → controlled 2D/3D DGL graphs
-│   ├── audit_openbind_structure_files.py
-│   │                                  # Audit 925 metadata rows against structure files
-│   ├── prepare_openbind_ligand_mgt.py # Curate labels/poses and freeze random/scaffold splits
-│   ├── preprocess_openbind_mgt_graphs.py
-│   │                                  # Build 621 original-MGT graph triplets on disk
-│   ├── prepare_openbind_original_entrypoints.py
-│   │                                  # Create leak-free roots for training.py/testing.py
-│   └── make_atom_init.py              # Original atom-initializer generation utility
-├── train_openbind_baseline.py        # Morgan, 2D GNN, 3D GNN and 3D ALIGNN trainer
-├── train_openbind_mgt.py             # Matched complete-MGT trainer
-├── train_openbind_masked.py          # Mask pretraining → matched ALIGNN/MGT fine-tuning
-├── pre-training.py                   # Original MGT masking-pretraining entry point
-├── training.py                       # Original Fabric MGT training entry point
-├── testing.py                        # Original Fabric MGT testing entry point
-├── run.py                            # Original checkpoint inference entry point
-├── OpenBind_EV-A71_2A/
-│   ├── OpenBind_EV-A71_2A/           # Downloaded OpenBind release and structure folders
-│   ├── experiment_a_ligand_mgt/
-│   │   ├── atom_init.json            # 90-dimensional original MGT atom features
-│   │   ├── id_prop.csv               # Structure ID,pKD for StructureDataset
-│   │   ├── raw/                      # Curated ligand-only crystallographic PDB files
-│   │   ├── curated/                  # Included compounds/structures and exclusions
-│   │   ├── splits/                   # Frozen random and scaffold manifests
-│   │   ├── processed/                # Frozen original-MGT DGL graph triplets
-│   │   └── reports/                  # Dataset, checksum and graph audit metadata
-│   └── original_entrypoints_random_seed_123/
-│       ├── train_validation/         # 528-structure root for original training.py
-│       └── test/                     # Untouched 93-structure root for testing.py
-└── output/
-    ├── openbind_baselines/           # Four unmasked baseline result trees
-    ├── openbind_full_mgt/            # Matched unmasked complete-MGT results
-    ├── openbind_masked_3d_alignn/    # Masked ALIGNN results
-    ├── openbind_masked_mgt/          # Masked complete-MGT results
-    └── openbind_original_entrypoints/# Original training.py/testing.py run
-```
-
-### Runtime call graph
-
-```text
-train_openbind_baseline.py
-├── MorganMLP + RDKit Morgan generator
-├── OpenBindGraphDataset
-│   ├── molecular_features.atom_features
-│   └── molecular_features.bond_features
-├── Ligand2DGNN
-│   └── model.alignn.EdgeGatedGraphConv
-├── Ligand3DGNN
-│   ├── modules.RBFExpansion
-│   └── model.alignn.EdgeGatedGraphConv
-└── Ligand3DALIGNN
-    ├── utils.datasets.compute_bond_cosines
-    ├── modules.RBFExpansion
-    └── model.alignn.ALIGNNLayer
-
-train_openbind_mgt.py
-├── utils.datasets.StructureDataset
-│   ├── processed/*.bin
-│   └── deterministic Laplacian PE
-└── model.graphformer.Graphformer
-    ├── model.transformer.multiheaded
-    ├── model.alignn.ALIGNNLayer
-    ├── model.alignn.EdgeGatedGraphConv
-    └── modules.{MLPLayer,RBFExpansion}
-
-train_openbind_masked.py
-├── utils.masker.MaskAtom
-├── ALIGNN encoder or Graphformer encoder
-├── temporary atom-feature reconstruction decoder
-└── unchanged matched trainer after decoder removal
-```
-
-### Source file reference
-
-| File | Responsibility | Called by |
-|---|---|---|
-| `model/alignn.py` | Original edge-gated convolution and angle–edge–atom update | Graphformer and all learned GNN baselines |
-| `model/transformer.py` | Original wider-graph multi-head attention | `graphformer.py` |
-| `model/graphformer.py` | Complete MGT composition and regression head | Original scripts, `train_openbind_mgt.py`, masked MGT |
-| `model/ligand_gnn.py` | 2D atom–bond model | `train_openbind_baseline.py` |
-| `model/ligand_3d_gnn.py` | Distance-RBF spatial model | `train_openbind_baseline.py` |
-| `model/ligand_3d_alignn.py` | Line-graph angular model using original ALIGNNLayer | Baseline and masked trainers |
-| `modules/modules.py` | MLP blocks and Gaussian RBF expansion | Graphformer and 3D baselines |
-| `utils/datasets.py` | Original structure-to-three-graph conversion and batching | Original scripts and matched MGT |
-| `utils/masker.py` | Randomly zero selected node feature vectors and retain labels | Original and matched masking workflows |
-| `utils/molecular_features.py` | Exact RDKit feature vocabularies and encoders | `openbind_ligand_dataset.py` |
-| `utils/openbind_ligand_dataset.py` | Load reference SDFs and create controlled graphs | Baseline trainer |
-| `utils/audit_openbind_structure_files.py` | Resolve metadata-to-structure mapping and checksums | Dataset preparation stage |
-| `utils/prepare_openbind_ligand_mgt.py` | Curation, PDB export, grouping and split generation | Run once before experiments |
-| `utils/preprocess_openbind_mgt_graphs.py` | Store Graphformer graph triplets as `.bin` | Run once before MGT training |
-| `utils/prepare_openbind_original_entrypoints.py` | Separate development and test roots | Original-script reproduction |
-| `train_openbind_baseline.py` | Shared matched training/evaluation for four baselines | CLI entry point |
-| `train_openbind_mgt.py` | Matched full-MGT training/evaluation | CLI and masked wrapper |
-| `train_openbind_masked.py` | Shared mask-pretrain/fine-tune experiment | CLI entry point |
-| `pre-training.py` | Original Fabric masking experiment | Original CLI; not used for matched results |
-| `training.py` | Original Fabric supervised training | Original CLI reproduction |
-| `testing.py` | Original Fabric MAE evaluation | Original CLI reproduction |
-| `run.py` | Original inference on unlabeled structures | Original CLI |
-
-## Original code and modifications
-
-### Source annotation convention
-
-Every Python module, class, function and method has a docstring. Meaningful tensor, graph, data-selection, normalization, masking, optimization, checkpoint and evaluation operations have adjacent inline comments. Multiline signatures, closing delimiters and repetitive `argparse` declarations are documented as logical groups so comments do not obscure executable code. The annotations describe behaviour only; they do not alter the original mathematical operators.
-
-The original scientific operators remain in their original files:
-
-- `model/alignn.py`: `ALIGNNLayer` and `EdgeGatedGraphConv`.
-- `model/transformer.py`: multi-head graph attention.
-- `model/graphformer.py`: full encoder ordering, feed-forward block, residual, normalization and pooling.
-- `modules/modules.py`: MLP and RBF calculations.
-- `utils/datasets.compute_bond_cosines`: angular calculation.
-
-Only two compatibility corrections were made inside original files:
-
-1. **Evaluation dropout correction** in `model/transformer.py`: functional dropout now receives `training=self.training`, so attention dropout is disabled during validation/testing and remains active during training.
-2. **OpenBind structure compatibility** in `utils/datasets.py`: non-periodic ligand PDBs can fall back to RDKit parsing; Laplacian positional-encoding signs are generated deterministically per structure and seed.
-
-New files add:
-
-- RDKit atom/bond chemistry for controlled baselines.
-- Crystallographic SDF loading and spatial edges.
-- Scalar pKD prediction heads.
-- Frozen manifest selection and compound leakage checks.
-- Train-only target normalization.
-- Standard regression metrics and compound aggregation.
-- OpenBind curation, split and graph preprocessing.
-- Matched atom-masking pretraining.
-
-Protein sequence fusion, protein embeddings, atom masking during ordinary supervised baselines, and unrelated material-property outputs are not used.
+- [Generate tables and figures](#generate-tables-and-figures)
+- [Project structure and file guide](#project-structure-and-file-guide)
+- [Legacy files and practical notes](#legacy-files-and-practical-notes)
+- [AI acknowledgement](#ai-acknowledgement)
 
 ## Installation
 
-The completed runs used Linux, Python 3.11 and CUDA. Verified package versions in the working environment were:
+Use a Linux NVIDIA GPU node, not a CPU-only or login node. The project was run
+on `chegpu004` with Python 3.11, an NVIDIA RTX 5080, PyTorch 2.11.0+cu128 and
+DGL 2.4.0+cu124. A new machine needs a suitable NVIDIA driver and an available
+GPU allocation. Follow your institution's instructions for allocating a GPU;
+this repository does not supply a scheduler job script.
 
-| Library | Version | Role |
-|---|---|---|
-| PyTorch | 2.11.0+cu128 | Tensor operations, optimization and neural networks |
-| DGL | 2.4.0+cu124 | Molecular, line and Coulomb graphs |
-| RDKit | 2025.09.5 | Molecule parsing, canonical identity, scaffolds and fingerprints |
-| Lightning | 2.6.5 | Original Fabric training/testing scripts |
-| NumPy | 2.4.6 | Numerical arrays |
-| SciPy | 1.17.1 | Pearson and Spearman statistics |
-| pandas | 3.0.3 | Original atom-initializer utility |
-| pymatgen | installed in `mgt` | Original CIF/PDB/XYZ molecule loading |
+Follow the sections in order to create a new environment, download the code and
+raw data, prepare the dataset, and run training, testing and analysis.
 
-Create and activate an environment:
+### Create the GPU environment
+
+Install or initialize Conda/Miniforge first. The commands below target Linux
+x86_64, Python 3.11 and CUDA 12.8-capable NVIDIA hardware; the PyTorch wheel also
+requires glibc 2.28 or newer.
 
 ```bash
-conda create -n mgt python=3.11 -y
-conda activate mgt
+conda create -n mgt-openbind-gpu -c conda-forge \
+  python=3.11.15 pip git git-lfs curl unzip -y
+conda activate mgt-openbind-gpu
+
+conda install -c dglteam/label/th24_cu124 -c conda-forge \
+  "dgl=2.4.0.th24.cu124=py311_0" -y
+
+python -m pip install "torch==2.11.0" \
+  --index-url https://download.pytorch.org/whl/cu128
+
+python -m pip install \
+  numpy==2.4.6 scipy==1.17.1 pandas==3.0.3 rdkit==2025.9.5 \
+  pymatgen==2026.5.4 pymatgen-core==2026.4.16 monty==2026.5.18 \
+  matplotlib==3.10.9 networkx==3.6.1 packaging==26.2 psutil==7.2.2 \
+  pydantic==2.12.5 PyYAML==6.0.3 requests==2.34.2 tqdm==4.68.4 \
+  Pillow==12.3.0 setuptools==78.1.0 \
+  jupyterlab==4.6.3 ipykernel==7.3.0 nbconvert==7.17.1 adjustText==1.4.0
+
+export DGLBACKEND=pytorch
 ```
 
-Install PyTorch appropriate for the machine’s CUDA driver. For CUDA 12.8:
+
+| Libraries | Purpose |
+|---|---|
+| PyTorch, DGL | Neural networks, GPU computation and graph message passing. |
+| RDKit | SDF parsing, atom/bond features, fingerprints and scaffold identification. |
+| pymatgen, Monty | Structure loading and MGT graph construction. |
+| NumPy, pandas, SciPy | Arrays, data manifests and evaluation statistics. |
+| Matplotlib, Pillow, adjustText | Figures, molecular illustrations and plot labels. |
+| JupyterLab, ipykernel, nbconvert | Running and exporting notebooks. |
+
+
+### Check the GPU installation
+
+Run these commands inside the activated `mgt-openbind-gpu` environment on the GPU node:
 
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
-```
+nvidia-smi
 
-Install the remaining packages:
-
-```bash
-conda install -c conda-forge rdkit pymatgen lightning pandas scipy numpy -y
-```
-
-Install a DGL build compatible with the installed PyTorch/CUDA combination. The experiments used DGL `2.4.0+cu124`; follow the DGL installation selector if that exact build is unavailable for the local platform.
-
-Verify the environment:
-
-```bash
 python - <<'PY'
-import torch, dgl, rdkit, lightning, numpy, scipy
-print("torch", torch.__version__, "cuda", torch.cuda.is_available())
-print("dgl", dgl.__version__)
-print("rdkit", rdkit.__version__)
-print("lightning", lightning.__version__)
-print("numpy", numpy.__version__)
-print("scipy", scipy.__version__)
+import torch
+import dgl
+import dgl.function as fn
+import numpy, pandas, scipy, rdkit, pymatgen, matplotlib
+
+assert torch.cuda.is_available(), "CUDA is unavailable; check your GPU allocation."
+g = dgl.graph(([0, 1], [1, 0])).to("cuda")
+x = torch.randn(2, 8, device="cuda", requires_grad=True)
+g.ndata["x"] = x
+g.update_all(fn.copy_u("x", "m"), fn.sum("m", "h"))
+g.ndata["h"].square().mean().backward()
+torch.cuda.synchronize()
+assert x.grad is not None
+print("PyTorch:", torch.__version__, "| DGL:", dgl.__version__)
+print("GPU:", torch.cuda.get_device_name(0))
+print("GPU graph forward/backward check passed.")
 PY
 ```
 
-## Reproducing the dataset
+Stop if this fails. A successful PyTorch import alone does not establish that
+DGL can run on the GPU. All training commands below explicitly use
+`--device cuda`.
 
-Run commands from the repository root.
 
-### 1. Audit the downloaded release
+## Download the project and raw data
 
-```bash
-python utils/audit_openbind_structure_files.py \
-  --dataset_root OpenBind_EV-A71_2A/OpenBind_EV-A71_2A
-```
+### Clone the code and official affinity reference
 
-This maps metadata records to structure directories, audits reference SDF/PDB availability and writes structure manifests/checksums.
-
-### 2. Curate ligand structures and create splits
+With the environment above activated, run the following from a directory where
+you want a new project workspace. The project directory is deliberately named
+`MGT`, matching the relative paths used by the scripts and notebooks.
 
 ```bash
-python utils/prepare_openbind_ligand_mgt.py \
-  --dataset_root OpenBind_EV-A71_2A/OpenBind_EV-A71_2A \
-  --benchmark_reference ../EV-A71_2A_benchmark/affinity/reference/fragalysis_compound_reference.csv \
-  --output_root OpenBind_EV-A71_2A/experiment_a_ligand_mgt
+mkdir -p mgt-openbind-workspace
+cd mgt-openbind-workspace
+
+git clone --depth 1 https://github.com/SameerHelaman/MGT-for-EVA712A.git MGT
+git clone https://github.com/OpenBind-Consortium/EV-A71_2A_benchmark.git EV-A71_2A_benchmark
+git -C EV-A71_2A_benchmark checkout --detach 86e5c12da518d749c33cfa9dcb6ae8eae1b804f9
+
+cd MGT
+
+printf '%s\n' \
+  '1ff937a952a9e11f9783c9de362b738a96e55e8b06ead2e41828ef90d8538fc8  ../EV-A71_2A_benchmark/affinity/reference/fragalysis_compound_reference.csv' \
+  | sha256sum --check - || exit 1
 ```
 
-This writes:
+The benchmark checkout is pinned to the revision used for this project. Its
+reference CSV is needed to select and verify the affinity labels; the raw
+structure archive alone is not sufficient. Keep this sibling-directory layout
+and run the remaining shell commands from `MGT/`.
 
-- `curated/openbind_ligand_structures.csv`
-- `curated/openbind_compounds.csv`
-- `curated/excluded_records.csv`
-- ligand-only crystallographic PDBs under `raw/`
-- `id_prop.csv`
-- random and scaffold split manifests
-- dataset metadata and checksums
+### 1. Download and extract the raw release
 
-### 3. Build frozen original-MGT graphs
+The source archive is the [OpenBind release on Zenodo](https://doi.org/10.5281/zenodo.20026661).
+
+```bash
+mkdir -p downloads OpenBind_EV-A71_2A
+
+curl --fail --location --retry 3 \
+  https://zenodo.org/api/records/20026661/files/OpenBind_EV-A71_2A.zip/content \
+  --output downloads/OpenBind_EV-A71_2A.zip
+
+printf '%s\n' \
+  '860a4979d0ba9decaa2bfaa933c1d217  downloads/OpenBind_EV-A71_2A.zip' \
+  | md5sum --check - || exit 1
+
+unzip -o downloads/OpenBind_EV-A71_2A.zip -d OpenBind_EV-A71_2A
+```
+
+This produces `OpenBind_EV-A71_2A/OpenBind_EV-A71_2A/`, containing
+`EV-A71_2A_metadata.csv` and `structures/`. The repeated directory name is
+intentional: the controlled graph loader expects reference SDFs there.
+Extraction with `-o` replaces files at that location, so use it for a fresh
+rebuild, not merely to inspect an existing dataset.
+
+### 2. Obtain the MGT atom-feature reference
+
+`atom_init.json` is required. It supplies fixed 90-dimensional elemental
+features, not learned affinity values. It cannot be derived from the affinity
+CSV alone.
+
+```bash
+mkdir -p examples/example_data
+
+curl --fail --location --retry 3 \
+  https://raw.githubusercontent.com/MolecularGraphTransformer/MGT/main/examples/example_data/atom_init.json \
+  --output examples/example_data/atom_init.json
+
+printf '%s\n' \
+  '93d7b2c2381f8dd9a465f4428e2d3fb6f72b3eadf3c6752591e7924b835809cd  examples/example_data/atom_init.json' \
+  | sha256sum --check - || exit 1
+```
+
+## Prepare the dataset
+
+Define the paths once. If starting a new terminal, activate the environment,
+return to `MGT/`, and define them again.
+
+```bash
+OPENBIND_RAW_ROOT="OpenBind_EV-A71_2A/OpenBind_EV-A71_2A"
+OPENBIND_DATA_ROOT="OpenBind_EV-A71_2A/experiment_a_ligand_mgt"
+OPENBIND_REFERENCE="../EV-A71_2A_benchmark/affinity/reference/fragalysis_compound_reference.csv"
+```
+
+### 1. Audit the raw structure files
+
+```bash
+python -m utils.audit_openbind_structure_files \
+  --dataset_root "$OPENBIND_RAW_ROOT"
+```
+
+This maps metadata records to structure files and records their availability
+and checksums in `$OPENBIND_RAW_ROOT/reports/`. Run it before curation.
+
+### 2. Curate the ligand dataset
+
+```bash
+python -m utils.prepare_openbind_ligand_mgt \
+  --dataset_root "$OPENBIND_RAW_ROOT" \
+  --benchmark_reference "$OPENBIND_REFERENCE" \
+  --output_root "$OPENBIND_DATA_ROOT"
+```
+
+This checks affinity/reference agreement and structure-quality rules, reads
+`ligand_ref.sdf`, and exports ligand-only PDB files without regenerating or
+minimizing their coordinates. It also creates compound identities, scaffold
+groups and the classic train/validation/test splits.
+
+For the specified release, the expected preparation is **925 source records →
+621 retained structures representing 474 compounds**, with 304 excluded
+records. Check the reports if your counts differ.
+
+| Generated file or directory, under `$OPENBIND_DATA_ROOT` | Contents |
+|---|---|
+| `curated/openbind_ligand_structures.csv` | Retained structure records, identities, labels and source paths. |
+| `curated/openbind_compounds.csv` | Compound-level records. |
+| `curated/excluded_records.csv` | Excluded records and reasons. |
+| `raw/` | Coordinate-preserving, ligand-only PDBs used by MGT. |
+| `id_prop.csv` | Structure identifiers and pKD targets for the MGT dataset. |
+| `atom_init.json` | Copy of the fixed MGT elemental-feature reference. |
+| `splits/` | Classic random and scaffold partitions. |
+| `reports/dataset_metadata.json` | Preparation rules, counts and provenance. |
+
+### 3. Build the MGT graph cache
 
 ```bash
 python -m utils.preprocess_openbind_mgt_graphs \
-  --data_root OpenBind_EV-A71_2A/experiment_a_ligand_mgt \
-  --seed 123
+  --data_root "$OPENBIND_DATA_ROOT" \
+  --seed 123 --local_radius 8.0 --max_neighbors 12 --num_pe_fea 10 \
+  --overwrite
 ```
 
-This creates one `.bin` file per curated structure in `processed/`. Each file stores local, line and Coulomb graphs produced by the original `StructureDataset` graph constructor.
+This writes one `.bin` per structure under `processed/`. Each contains the
+local graph, its line graph and the wider Coulomb-feature graph. Expect 621
+cache files; inspect `reports/processed_graph_summary.json` and
+`reports/processed_graph_manifest.csv`.
 
-## Reproducing the experiments
+`--overwrite` rebuilds the cache and is intentional for a from-scratch run.
+Without it, existing files can be reused even if graph settings have changed.
+The Morgan and controlled GNN trainers use the original reference SDFs; only
+the MGT variants use this three-graph cache.
 
-All commands default to seed 123 and use CUDA automatically when available.
+## Create the splits
 
-### Four controlled baselines
+### Classic random and scaffold splits
+
+The curation command already creates:
+
+```text
+splits/random_seed_123.csv
+splits/scaffold_seed_123.csv
+```
+
+Each divides the 621 structure rows into 435 training, 93 validation and
+93 test rows. Repeated structures of a compound remain together. The scaffold
+split additionally separates Bemis–Murcko scaffold groups.
+
+### Random and scaffold five-fold CV
 
 ```bash
-python train_openbind_baseline.py --model morgan_mlp --split_method random --device auto
-python train_openbind_baseline.py --model morgan_mlp --split_method scaffold --device auto
+python -m utils.generate_random_cv \
+  --data_root "$OPENBIND_DATA_ROOT" \
+  --source "$OPENBIND_DATA_ROOT/splits/random_seed_123.csv" \
+  --output_dir "$OPENBIND_DATA_ROOT/cv_random" \
+  --folds 5 --seed 123
 
-python train_openbind_baseline.py --model 2d_gnn --split_method random --device auto
-python train_openbind_baseline.py --model 2d_gnn --split_method scaffold --device auto
-
-python train_openbind_baseline.py --model 3d_gnn --split_method random --device auto
-python train_openbind_baseline.py --model 3d_gnn --split_method scaffold --device auto
-
-python train_openbind_baseline.py --model 3d_alignn --split_method random --device auto
-python train_openbind_baseline.py --model 3d_alignn --split_method scaffold --device auto
+python -m utils.generate_scaffold_cv \
+  --data_root "$OPENBIND_DATA_ROOT" \
+  --source "$OPENBIND_DATA_ROOT/splits/scaffold_seed_123.csv" \
+  --output_dir "$OPENBIND_DATA_ROOT/cv" \
+  --folds 5 --seed 123
 ```
 
-### Matched complete MGT
+These use all curated records in their source manifests, not just the classic
+training subset. Random CV groups by compound and balances affinity; scaffold
+CV keeps scaffold groups separate. Each outer fold has its own training,
+validation and test membership.
+
+The directories contain `cv_metadata.json`, an overall assignment CSV and
+five trainer-ready manifests:
+
+```text
+cv_random/random_grouped_5fold_seed_123.csv
+cv_random/random_cv5_fold_0_seed_123.csv       # folds 0 through 4
+cv/scaffold_grouped_5fold_seed_123.csv
+cv/scaffold_cv5_fold_0_seed_123.csv            # folds 0 through 4
+```
+
+Read `cv_metadata.json` for counts and leakage checks. Keep seed 123:
+preparation filenames and notebooks are written around that experiment.
+
+## Run training and testing
+
+The training scripts select the best validation checkpoint and then evaluate
+the held-out test partition automatically. There is no separate `testing.py`
+step for these experiments.
+
+### 1. Random five-fold CV: all seven models
 
 ```bash
-python train_openbind_mgt.py --split_method random --seed 123 --device auto
-python train_openbind_mgt.py --split_method scaffold --seed 123 --device auto
+python run_openbind_cv.py \
+  --cv_method random --models all --folds 0 1 2 3 4 \
+  --data_root "$OPENBIND_DATA_ROOT" \
+  --cv_dir "$OPENBIND_DATA_ROOT/cv_random" \
+  --output_root output/openbind_random_cv \
+  --seed 123 --device cuda --batch_size 32 \
+  --max_epochs 200 --early_stopping_patience 10 \
+  --pretrain_epochs 30 --mask_rate 0.2
 ```
 
-These commands use the complete original `Graphformer`, frozen partitions, matched target normalization, early stopping and complete metrics.
-
-### Masked-pretrained ALIGNN and MGT
+### 2. Scaffold five-fold CV: all seven models
 
 ```bash
-python train_openbind_masked.py \
-  --model 3d_alignn \
-  --split_method random \
-  --pretrain_epochs 30 \
-  --mask_rate 0.2 \
-  --device auto
-
-python train_openbind_masked.py \
-  --model 3d_alignn \
-  --split_method scaffold \
-  --pretrain_epochs 30 \
-  --mask_rate 0.2 \
-  --device auto
-
-python train_openbind_masked.py \
-  --model mgt \
-  --split_method random \
-  --pretrain_epochs 30 \
-  --mask_rate 0.2 \
-  --device auto
-
-python train_openbind_masked.py \
-  --model mgt \
-  --split_method scaffold \
-  --pretrain_epochs 30 \
-  --mask_rate 0.2 \
-  --device auto
+python run_openbind_cv.py \
+  --cv_method scaffold --models all --folds 0 1 2 3 4 \
+  --data_root "$OPENBIND_DATA_ROOT" \
+  --cv_dir "$OPENBIND_DATA_ROOT/cv" \
+  --output_root output/openbind_scaffold_cv \
+  --seed 123 --device cuda --batch_size 32 \
+  --max_epochs 200 --early_stopping_patience 10 \
+  --pretrain_epochs 30 --mask_rate 0.2
 ```
 
-### Original `training.py` and `testing.py`
+Together these commands perform 70 supervised fits: seven configurations × two
+CV methods × five folds. The two masked configurations also perform a
+training-fold-only pretraining stage before each supervised fit. The runner
+launches the models sequentially using the active Python environment and writes
+summaries after the requested runs.
 
-Prepare non-overlapping roots:
+To run a subset, replace `--models all` with space-separated model keys, for
+example `--models 3d_gnn adapted_mgt masked_mgt`. To select one outer fold,
+use `--folds 0`. Such a subset is not the complete five-fold experiment.
+
+Add `--resume` to the same command to skip runs that already have
+`metrics.json` and `test_compound_predictions.csv`. This is a completed-run
+skip, not an optimizer/checkpoint restart. It does not verify that previous
+settings match, so use a new `--output_root` when changing an experiment.
+
+### 3. Classic train/validation/test experiments
+
+These are separate experiments using `splits/*_seed_123.csv`, not prerequisites
+for CV. The following loop runs all five unmasked models on both classic splits:
 
 ```bash
-python utils/prepare_openbind_original_entrypoints.py
+for OPENBIND_SPLIT in random scaffold; do
+  for OPENBIND_TRAINER in \
+    train_openbind_morgan_mlp.py \
+    train_openbind_2d_gnn.py \
+    train_openbind_3d_gnn.py \
+    train_openbind_3d_alignn.py \
+    train_openbind_mgt.py; do
+    python "$OPENBIND_TRAINER" \
+      --data_root "$OPENBIND_DATA_ROOT" \
+      --split_method "$OPENBIND_SPLIT" --seed 123 --device cuda \
+      --batch_size 32 --max_epochs 200 --early_stopping_patience 10 \
+      || exit 1
+  done
+done
 ```
 
-Train for 100 epochs with the original Fabric workflow:
+Run both masked configurations on both classic splits:
 
 ```bash
-python training.py \
-  --root OpenBind_EV-A71_2A/original_entrypoints_random_seed_123/train_validation \
-  --model_path output/openbind_original_entrypoints/random/seed_123/checkpoints \
-  --save_dir output/openbind_original_entrypoints/random/seed_123/logs \
-  --run_name training_py \
-  --n_devices 1 \
-  --accelerator cuda \
-  --process 0 \
-  --periodic 0 \
-  --out_dims 1 \
-  --out_names pKD \
-  --epochs 100 \
-  --batch_size 2 \
-  --n_cum 8 \
-  --train_split 0.8 \
-  --val_split 0.2 \
-  --num_layers 1 \
-  --n_mha 1 \
-  --n_alignn 3 \
-  --n_gnn 3
+for OPENBIND_SPLIT in random scaffold; do
+  python train_openbind_masked.py \
+    --model 3d_alignn --split_method "$OPENBIND_SPLIT" \
+    --data_root "$OPENBIND_DATA_ROOT" --seed 123 --device cuda \
+    --pretrain_epochs 30 --mask_rate 0.2 \
+    --batch_size 32 --max_epochs 200 --early_stopping_patience 10 \
+    || exit 1
+
+  python train_openbind_masked.py \
+    --model mgt --split_method "$OPENBIND_SPLIT" \
+    --data_root "$OPENBIND_DATA_ROOT" --seed 123 --device cuda \
+    --pretrain_epochs 30 --mask_rate 0.2 --max_neighbors 12 \
+    --batch_size 32 --max_epochs 200 --early_stopping_patience 10 \
+    || exit 1
+done
 ```
 
-Test the lowest-validation checkpoint on the untouched test root:
+Each masked command performs **pretraining → supervised fine-tuning → testing**.
+Do not run the unmasked trainer afterwards to continue it; that starts a new
+model. The scripts use separate default output directories, listed below.
 
-```bash
-python testing.py \
-  --root OpenBind_EV-A71_2A/original_entrypoints_random_seed_123/test \
-  --model_path output/openbind_original_entrypoints/random/seed_123/checkpoints \
-  --model_name lowest.ckpt \
-  --save_dir output/openbind_original_entrypoints/random/seed_123/logs \
-  --run_name testing_py \
-  --n_devices 1 \
-  --accelerator cuda \
-  --process 0 \
-  --periodic 0 \
-  --out_dims 1 \
-  --out_names pKD \
-  --num_layers 1 \
-  --n_mha 1 \
-  --n_alignn 3 \
-  --n_gnn 3
-```
+## Models and training procedure
 
-The completed original run trained in approximately 24.3 minutes and produced compound-level random-test RMSE 0.475 and R² 0.622. Its internal train/validation division is made by the original `random_split` without a supplied generator, so that internal membership is not deterministic across fresh executions. The independent test root remains frozen.
+| CV key | Input and implementation |
+|---|---|
+| `morgan_mlp` | Radius-2, 2,048-bit Morgan fingerprint; MLP with widths 2,048 → 128 → 64 → 1. |
+| `2d_gnn` | RDKit atom features and chemical-bond edges; learned graph message passing. |
+| `3d_gnn` | Chemical bonds plus spatial neighbours within 5 Å; distance-RBF features. |
+| `3d_alignn` | The 3D graph plus a line graph encoding angles; coupled angle–edge–atom updates. |
+| `adapted_mgt` | Graphformer using local, line and wider graphs; adapted to non-periodic ligands and scalar pKD prediction. |
+| `masked_alignn` | The 3D ALIGNN encoder after atom-feature reconstruction pretraining. |
+| `masked_mgt` | The adapted MGT encoder after atom-feature reconstruction pretraining. |
+
+The controlled GNNs use 152-dimensional atom and 12-dimensional bond features.
+Their 3D graphs select up to 32 spatial neighbours per atom in addition to
+retaining chemical bonds. MGT uses a different representation: 90-dimensional
+elemental features, 10-dimensional Laplacian positional encoding, an 8 Å local
+graph capped at 12 neighbours, angular updates and wider-graph attention.
+These models are therefore not all single-variable architectural ablations.
+
+MGT's wider edges carry `Zi × Zj / rij`, using atomic numbers and distances.
+These are **Coulomb-inspired descriptors, not physical electrostatic energies
+or learned partial charges**. Geometry is encoded through graph features,
+not an image of the molecule.
+
+### Training and evaluation
+
+Targets are normalized using the training structures' mean and population
+standard deviation only. All main trainers use Adam (`lr=1e-4`,
+`weight_decay=1e-5`), Huber loss (`delta=1`), batch size 32 and at most
+200 epochs. Validation loss controls learning-rate reduction (factor 0.5,
+patience 5), early stopping (patience 10), and checkpoint selection.
+
+The best validation checkpoint is restored before evaluation. Predictions are
+converted back to pKD and averaged across repeated structures of each compound.
+Metrics are MAE, MSE, RMSE, R², Pearson and Spearman correlations. Complete CV
+pools one outer-test prediction per compound across five folds.
+
+### Masked pretraining
+
+The masked trainer reuses `utils.masker.MaskAtom` to zero approximately 20% of
+the batched atoms' complete feature vectors. A temporary linear decoder
+reconstructs them from 512-dimensional encoder states using masked-node MSE
+for 30 epochs, with training-partition structures only.
+
+Connectivity, distances, angles and MGT positional/Coulomb information remain
+available: this is feature masking, not atom removal. The decoder is discarded
+and all encoder weights are fine-tuned for affinity. Pretraining history is
+stored in `metrics.json`, not a separate reusable pretraining checkpoint.
 
 ## Output files
 
-Every matched experiment directory contains:
+Every completed main training run writes:
+
+| File | Contents |
+|---|---|
+| `best_*.pt` | Best validation checkpoint. MGT uses `best_openbind_mgt.pt`. |
+| `history.csv` | Epoch-level training loss, validation loss and learning rate. |
+| `metrics.json` | Arguments, counts, model details, normalization and evaluation metrics. Masked runs also include pretraining history. |
+| `test_structure_predictions.csv` | One held-out prediction per structure. |
+| `test_compound_predictions.csv` | Structure predictions averaged per compound. |
+
+Classic results use these directories, with `<split>` equal to `random` or
+`scaffold`:
 
 ```text
-best_*.pt                       # Best validation-loss model weights
-history.csv                     # Epoch, training loss, validation loss and LR
-test_structure_predictions.csv # One row per crystal structure
-test_compound_predictions.csv  # Mean prediction per official compound group
-metrics.json                    # Config, counts, architecture and all metrics
+output/openbind_baselines/<model>/<split>/seed_123/
+output/openbind_full_mgt/<split>/seed_123/
+output/openbind_masked_3d_alignn/3d_alignn/<split>/seed_123/
+output/openbind_masked_mgt/<split>/seed_123/
 ```
 
-Masked `metrics.json` files additionally contain:
+CV results are separated by method and outer fold:
 
-```json
-{
-  "masked_pretraining": {
-    "transform": "original utils.masker.MaskAtom",
-    "mask_rate": 0.2,
-    "epochs": 30,
-    "objective": "MSE atom-feature reconstruction",
-    "training_partition_only": true,
-    "history": []
-  }
-}
+```text
+output/openbind_random_cv/             # also output/openbind_scaffold_cv/
+├── run_log.json
+├── fold_0/                           # through fold_4/
+│   ├── unmasked/<model>/<method>/seed_123/
+│   ├── masked_alignn/3d_alignn/<method>/seed_123/
+│   └── masked_mgt/<method>/seed_123/
+└── summary/
+    ├── fold_metrics.csv
+    ├── cv_summary.json
+    └── <model>_out_of_fold_compound_predictions.csv
 ```
 
-Result locations:
+`fold_metrics.csv` contains the individual fold scores. `cv_summary.json`
+contains aggregate summaries, and each out-of-fold CSV contains the pooled
+compound predictions. Check that all five folds are present before using them
+as complete CV results.
 
-- `output/openbind_baselines/<model>/<split>/seed_123/`
-- `output/openbind_full_mgt/<split>/seed_123/`
-- `output/openbind_masked_3d_alignn/3d_alignn/<split>/seed_123/`
-- `output/openbind_masked_mgt/<split>/seed_123/`
-- `output/openbind_original_entrypoints/random/seed_123/`
+Retain `metrics.json` alongside a checkpoint: the controlled trainers save a
+model state dictionary, while the MGT checkpoint also includes its scaler.
+The legacy `testing.py` and `run.py` use a different checkpoint workflow;
+they are not general inference commands for these `.pt` files.
 
-## Implementation walkthrough
+## Generate tables and figures
 
-### Data flow
+Run the notebooks after completing both five-fold CV commands. They read saved
+predictions and metrics; they do not train the models.
 
-1. The audit script resolves each metadata row to the official structure directory.
-2. The preparation script applies quality rules, reads `ligand_ref.sdf`, preserves its coordinates and writes ligand-only PDB files.
-3. Canonical SMILES identify compounds; Bemis–Murcko SMILES define scaffold groups.
-4. Compound groups are allocated to frozen train/validation/test manifests.
-5. Controlled baselines read the reference SDF directly and construct only the graph information required by that ablation.
-6. Complete MGT reads frozen `.bin` triplets created by the original graph constructor.
-7. Targets are normalized with training labels only.
-8. The best validation checkpoint is evaluated once on train, validation and held-out test partitions.
-9. Repeated crystallographic structures are averaged to produce compound-level predictions.
+### Start Jupyter on the GPU node
 
-### Controlled graph construction
+From `MGT/`, activate the environment created during installation and start Jupyter:
 
-`OpenBindGraphDataset.__getitem__` loads a fresh RDKit molecule from the structure’s `ligand_ref.sdf`. In 2D mode it creates directed chemical-bond edges only. In 3D modes it adds directed spatial edges within the cutoff, retains chemical-bond feature vectors where bonds exist, supplies zero bond chemistry for non-bonded spatial edges, and stores distance and displacement tensors.
+```bash
+conda activate mgt-openbind-gpu
 
-### Original MGT graph construction
+python -m ipykernel install --user --name mgt-practical \
+  --display-name "Python (MGT practical)"
 
-`StructureDataset._construct_graph` creates:
+python -m jupyter lab notebooks --no-browser --ip=127.0.0.1
+```
 
-- `G`: local neighbours, atom features, distances, displacement vectors and Laplacian PE.
-- `LG`: the line graph of `G`, with angle cosine on every valid edge pair.
-- `FG`: the wider graph with Coulomb edge feature `ZiZj / rij`.
+Connect through your institution's approved SSH tunnel or remote Jupyter
+service, using the URL/token printed by Jupyter. Select **Python (MGT practical)**
+as the notebook kernel. Confirm `sys.executable` points to the intended Conda
+environment.
 
-`Graphformer.forward` embeds these features, applies the original encoder stack, averages atom representations and predicts one scalar.
+### Run the notebooks in this order
 
-### Masking flow
+The reporting workflow uses the three notebooks below. Each has concise
+code-purpose markdown and comments, with shared imports collected near the top.
+Run the cells in order so the setup and data-loading cells run before plotting.
 
-1. `MaskAtom` samples at least one node and approximately 20% of each batched graph’s nodes.
-2. It copies the original selected feature vectors into a node subgraph.
-3. It replaces those vectors with zeros in the encoder input.
-4. ALIGNN or MGT generates contextual atom representations.
-5. A temporary decoder reconstructs the held-out features.
-6. After 30 epochs, the decoder is discarded.
-7. The encoder weights initialize normal supervised affinity fine-tuning.
+| Notebook | What to do and what it produces |
+|---|---|
+| [openbind_results_analysis.ipynb](notebooks/openbind_results_analysis.ipynb) | Open after all CV fits finish. Run its analysis cells in order to generate tables and figures in `output/dissertation_analysis/`. |
+| [openbind_results_and_discussion.ipynb](notebooks/openbind_results_and_discussion.ipynb) | Open after the analysis notebook. Displays the generated artifacts with written interpretation; it does not replace the analysis step. |
+| [openbind_methodology_figures.ipynb](notebooks/openbind_methodology_figures.ipynb) | Generates workflow/model diagrams using the prepared data and splits. Most outputs go to `output/methodology_figures/`; see the compound-view exception below. |
 
-## Limitations
+The analysis notebook begins with a `%pip install adjustText` setup cell before
+the shared imports. The package is
+already installed by the setup above: skip that cell, or use **Save As** to
+create `openbind_results_analysis.local.ipynb`, comment out that line in the
+copy, then run all cells. Renaming the original notebooks is otherwise
+unnecessary.
 
-- Results currently use one seed. Run at least five seeds and report mean ± standard deviation or confidence intervals.
-- The masked-MGT versus distance-GNN scaffold RMSE difference is only 0.004 pKD and is not established statistically.
-- The dataset is small relative to the 8.1M ALIGNN and 13.7M MGT models.
-- Multiple crystal structures can weight compounds with repeated structures more heavily during structure-level training, although compound identities never cross partitions.
-- Ligand-only models cannot explicitly represent protein–ligand contacts, water networks, protonation coupling or receptor conformational change.
-- Crystal poses are experimental inputs; performance is not equivalent to prediction from SMILES alone or from docked/generated poses.
-- The original Fabric training script has different loss, batching and internal split behaviour from the matched trainer; its result is a compatibility reproduction, not a controlled replacement for the matched comparison.
+The written discussion, selected-model labels and some captions contain
+project-specific values. Review them after new experiments; rerunning the
+notebooks does not automatically rewrite all narrative claims.
 
-## Final conclusion
+### Main generated tables
 
-Crystallographic distances robustly improve single-target affinity prediction over fixed fingerprints and 2D learned graphs. Angular ALIGNN processing improves random-split interpolation but does not improve unseen-scaffold performance. Complete MGT overfits when trained only on affinity labels, but atom-masking pretraining substantially improves its scaffold result from RMSE 0.757/R² -0.125 to RMSE 0.651/R² 0.170. Masked MGT is numerically strongest, while the crystallographic 3D distance GNN provides nearly identical scaffold performance with less than one-third of the parameters.
+These are written under `output/dissertation_analysis/tables/`:
 
-## Data license and acknowledgement
+| Filename | Contents |
+|---|---|
+| `table_random_cv_performance.csv` | Model comparison for random CV. |
+| `table_scaffold_cv_performance.csv` | Model comparison for scaffold CV. |
+| `table_all_cv_model_scores.csv` | Combined model scores for both CV designs. |
+| `table_all_cv_fold_scores.csv` | Individual model/fold scores. |
+| `table_random_cv_best_model_per_fold.csv` | Lowest-test-RMSE model in each random outer fold. |
+| `table_scaffold_cv_best_model_per_fold.csv` | Lowest-test-RMSE model in each scaffold outer fold. |
 
-The OpenBind dataset is released under CC0 1.0 Universal. Credit the OpenBind Consortium and the EV-A71/CVA16 2A protease structure–affinity release when publishing results derived from this repository.
+The last two tables are **post-hoc comparisons of test results**, not a
+validation-based procedure for choosing a model. Analysis figures go to
+`output/dissertation_analysis/figures/`; `artifact_manifest.csv` records the
+main saved artifacts.
+
+### If you change input or output paths
+
+The commands above use the notebook defaults, so no path edits are needed for
+that layout. For renamed experiment directories, change the following settings
+in a working copy of the notebooks:
+
+| Notebook/location | Settings to change |
+|---|---|
+| Analysis: initial configuration cell | `RESULT_ROOTS["random"]`, `RESULT_ROOTS["scaffold"]`, `DATA_ROOT` and, if needed, `ANALYSIS_ROOT`, `FIGURE_ROOT`, `TABLE_ROOT`. |
+| Analysis: both later cells beginning `def find_project_root()` | Update their hard-coded root-search paths, `CV_PATHS` and `TABLE_ROOT`. In the first, `CV_PATHS` points to summary **directories**; in the second, to **fold_metrics.csv files**. Changing only the initial cell is insufficient. |
+| Discussion: initial configuration cell | Update both the search for `output/dissertation_analysis` and the assigned `ANALYSIS_ROOT`. |
+| Methodology: initial configuration cell | Update `DATA_ROOT` and `OUTPUT_ROOT`. |
+| Methodology: compound-level 3D-view cell | Check `MGT_ROOT`, `EXPERIMENT_ROOT`, `SOURCE_DATASET_ROOT` and `CURATED_PATH`. This cell resolves paths separately. |
+
+Keep the analysis output under the repository root because artifact paths are
+recorded relative to it. A different dataset, seed or fold count also requires
+reviewing the notebooks' fixed filenames/counts; changing the output directory
+alone does not generalize them.
+
+The compound-level view saves `figure_2_7_compound_level_3d_model_view.png`
+and `.pdf`. Its default is `output/dissertation_analysis/figures/`, separate
+from the other methodology figures. To put it with them, set
+`FIGURE_ROOT = OUTPUT_ROOT` before that cell in your working copy. This figure
+is not added to the main methodology artifact list.
+
+## Project structure and file guide
+
+```text
+your-workspace/
+├── EV-A71_2A_benchmark/                 official affinity reference
+└── MGT/
+    ├── README.md
+    ├── train_openbind_*.py             individual training entry points
+    ├── run_openbind_cv.py              all-model CV orchestration
+    ├── run_scaffold_cv.py              scaffold-default wrapper
+    ├── model/                         neural-network architectures
+    ├── modules/                       shared neural-network layers
+    ├── utils/                         data, features, graphs, splits and masks
+    ├── notebooks/                     analysis and figure generation
+    ├── examples/example_data/atom_init.json
+    ├── OpenBind_EV-A71_2A/
+    │   ├── OpenBind_EV-A71_2A/         extracted metadata and structures
+    │   └── experiment_a_ligand_mgt/   generated training dataset
+    │       ├── atom_init.json
+    │       ├── id_prop.csv
+    │       ├── raw/
+    │       ├── processed/
+    │       ├── curated/
+    │       ├── reports/
+    │       ├── splits/
+    │       ├── cv_random/
+    │       └── cv/
+    └── output/                        checkpoints, predictions and figures
+```
+
+### What each active Python file does
+
+| File | Responsibility and connection to the workflow |
+|---|---|
+| [run_openbind_cv.py](run_openbind_cv.py) | Creates/loads the requested CV manifests, launches individual trainers and aggregates outer-test compound predictions. |
+| [run_scaffold_cv.py](run_scaffold_cv.py) | Convenience entry point for the same workflow with scaffold CV as the default. |
+| [train_openbind_morgan_mlp.py](train_openbind_morgan_mlp.py) | Builds Morgan fingerprints and trains/evaluates the fingerprint MLP. |
+| [train_openbind_2d_gnn.py](train_openbind_2d_gnn.py) | Trains/evaluates the atom–bond graph model using the shared ligand dataset. |
+| [train_openbind_3d_gnn.py](train_openbind_3d_gnn.py) | Trains/evaluates the crystallographic distance model. |
+| [train_openbind_3d_alignn.py](train_openbind_3d_alignn.py) | Trains/evaluates the distance-and-angle model; also supplies the supervised stage used by masked ALIGNN. |
+| [train_openbind_mgt.py](train_openbind_mgt.py) | Loads cached graph triplets and trains/evaluates Graphformer; also supplies the supervised stage used by masked MGT. |
+| [train_openbind_masked.py](train_openbind_masked.py) | Applies training-partition masking, trains a reconstruction decoder, then invokes ALIGNN or MGT affinity fine-tuning/evaluation. |
+| [utils/audit_openbind_structure_files.py](utils/audit_openbind_structure_files.py) | Resolves raw structure-file locations and writes the audit manifest/checksums. |
+| [utils/prepare_openbind_ligand_mgt.py](utils/prepare_openbind_ligand_mgt.py) | Filters records, checks official labels, exports ligand PDBs and creates curated tables/classic splits. |
+| [utils/preprocess_openbind_mgt_graphs.py](utils/preprocess_openbind_mgt_graphs.py) | Builds and saves the MGT three-graph cache with provenance reports. |
+| [utils/generate_random_cv.py](utils/generate_random_cv.py) | Creates compound-grouped random outer folds and per-fold train/validation/test manifests. |
+| [utils/generate_scaffold_cv.py](utils/generate_scaffold_cv.py) | Creates scaffold-disjoint outer folds and their manifests; CV uses achiral scaffold grouping. |
+| [utils/molecular_features.py](utils/molecular_features.py) | Defines RDKit atom/bond feature vocabularies and encoding functions. |
+| [utils/openbind_ligand_dataset.py](utils/openbind_ligand_dataset.py) | Loads reference SDFs and constructs the controlled 2D/3D graphs used by the GNN trainers. |
+| [utils/datasets.py](utils/datasets.py) | Supplies MGT structure loading, graph construction/batching, positional encoding and angle-cosine calculations. |
+| [utils/masker.py](utils/masker.py) | Implements the original `MaskAtom` transform reused for atom-feature masking. |
+| [model/ligand_gnn.py](model/ligand_gnn.py) | Defines the 2D ligand graph network. |
+| [model/ligand_3d_gnn.py](model/ligand_3d_gnn.py) | Defines the distance-based ligand graph network. |
+| [model/ligand_3d_alignn.py](model/ligand_3d_alignn.py) | Defines the ligand ALIGNN encoder using the shared angular layers. |
+| [model/alignn.py](model/alignn.py) | Implements `ALIGNNLayer` and `EdgeGatedGraphConv`, reused by the graph models. |
+| [model/transformer.py](model/transformer.py) | Implements wider-graph multi-head attention used by Graphformer. |
+| [model/graphformer.py](model/graphformer.py) | Combines MGT attention, angular/local updates, feed-forward processing, pooling and prediction. |
+| [modules/modules.py](modules/modules.py) | Supplies shared MLP and radial-basis expansion layers. |
+| `model/__init__.py`, `modules/__init__.py`, `utils/__init__.py` | Package initialization and imports; retain these with their directories. |
+
+In short, preparation creates the data/manifests; the CV runner passes each
+manifest to a trainer; the trainer loads its dataset and model implementation;
+the notebooks read the saved predictions and summaries. The `model/`,
+`modules/` and `utils/` files are imported by the entry points, not run
+individually in sequence.
+
+## Legacy files and practical notes
+
+These files are retained for reference or optional upstream reproduction.
+They are **not required steps** for the main commands above.
+
+| File/resource | Status |
+|---|---|
+| [pre-training.py](pre-training.py) | Original Fabric pretraining workflow; not the matched training-fold masking experiment. |
+| [training.py](training.py), [testing.py](testing.py), [run.py](run.py) | Original supervised training, testing and inference entry points. They use different settings/checkpoint conventions; do not substitute them for the matched trainers. |
+| [utils/prepare_openbind_original_entrypoints.py](utils/prepare_openbind_original_entrypoints.py) | Prepares separate data roots for the original entry points only. |
+| [utils/make_atom_init.py](utils/make_atom_init.py), `utils/atomic_properties.xlsx` | Optional elemental-feature generation utility and source workbook. Not needed when using the verified `atom_init.json`. |
+| `__pycache__/`, `*.pyc` | Automatically generated Python caches; not source or data dependencies. |
+
+Do not remove `atom_init.json` or the original neural-network modules just
+because their names come from upstream: the active MGT workflow imports them.
+The old shared `train_openbind_baseline.py` has been replaced by the four
+standalone baseline trainers.
+
+Practical checks:
+
+- Use the stated directory layout. Changing `--data_root` does not change the
+  controlled loader's repository-relative source-SDF location.
+- The preparation code includes checks specific to this release. It is not an
+  arbitrary-dataset importer; retain the expected source files and reference.
+- Stop when a command fails. A missing raw file, unresolved Git LFS pointer or
+  incomplete graph cache must be fixed before training.
+- For a new run in an existing checkout, use new output directories and update
+  all notebook path settings described above. Defaults may contain completed
+  work.
+- Before handing over or uploading the repository, include all active source
+  files and notebooks in the file guide. Generated `output/` files are ignored
+  by Git; provide them separately if the recipient should analyse completed
+  runs without retraining.
+
+### Sources
+
+The implementation builds on the
+[original Molecular Graph Transformer](https://github.com/MolecularGraphTransformer/MGT).
+Raw structures come from the
+[OpenBind data release](https://doi.org/10.5281/zenodo.20026661);
+the official labels/reference are in the
+[EV-A71 2A benchmark repository](https://github.com/OpenBind-Consortium/EV-A71_2A_benchmark).
+Use those projects' acknowledgements and licence terms when redistributing
+their code or data.
+
+## AI acknowledgement
+
+OpenAI Codex was used to assist with debugging and code annotation. All
+AI-assisted outputs were reviewed and verified by the author before being used
+in this project.

@@ -1,195 +1,207 @@
+# =============================================================================
+# MODULE: pre-training.py
+# PURPOSE: Original Fabric atom-masking pretraining entry point.
+# LIBRARIES: Imports below identify Python standard-library, third-party scientific,
+#            and local MGT/OpenBind modules used by this file.
+# OUTPUT: Lightning CSV logs and pretrained checkpoints.
+# CALCULATIONS: No additional project-specific equation beyond the operations identified in the line annotations and called modules.
+# NOTE: Comments document the implementation; executable statements are unchanged.
+# =============================================================================
 """Original Fabric entry point for masked-atom MGT pretraining."""
 
-import os
-import time
-import pathlib
-import argparse
+import os  # Load a standard-library, scientific, or local project dependency.
+import time  # Load a standard-library, scientific, or local project dependency.
+import pathlib  # Load a standard-library, scientific, or local project dependency.
+import argparse  # Load a standard-library, scientific, or local project dependency.
 
-import dgl
-import torch
-import numpy as np
-import os.path as osp
-import torch.nn as nn
-import torch.optim as optim
+import dgl  # Load a standard-library, scientific, or local project dependency.
+import torch  # Load a standard-library, scientific, or local project dependency.
+import numpy as np  # Load a standard-library, scientific, or local project dependency.
+import os.path as osp  # Load a standard-library, scientific, or local project dependency.
+import torch.nn as nn  # Load a standard-library, scientific, or local project dependency.
+import torch.optim as optim  # Load a standard-library, scientific, or local project dependency.
 
-from model.transformer import multiheaded
-from model.alignn import EdgeGatedGraphConv
-from model.graphformer import Graphformer, encoder
-from utils.datasets import StructureDataset
-from utils.masker import MaskAtom
+from model.transformer import multiheaded  # Import selected classes or functions from the named dependency.
+from model.alignn import EdgeGatedGraphConv  # Import selected classes or functions from the named dependency.
+from model.graphformer import Graphformer, encoder  # Import selected classes or functions from the named dependency.
+from utils.datasets import StructureDataset  # Import selected classes or functions from the named dependency.
+from utils.masker import MaskAtom  # Import selected classes or functions from the named dependency.
 
-from torch.nn import Linear
-from lightning.fabric import Fabric
-from torch.utils.data import DataLoader
-from lightning.fabric.loggers import CSVLogger
-from lightning.fabric.strategies import FSDPStrategy
+from torch.nn import Linear  # Import selected classes or functions from the named dependency.
+from lightning.fabric import Fabric  # Import selected classes or functions from the named dependency.
+from torch.utils.data import DataLoader  # Import selected classes or functions from the named dependency.
+from lightning.fabric.loggers import CSVLogger  # Import selected classes or functions from the named dependency.
+from lightning.fabric.strategies import FSDPStrategy  # Import selected classes or functions from the named dependency.
 
 
-def pre_train(args, loader, main_model, atom_model, main_optim, atom_optim, criterion, fabric: Fabric):
+# FUNCTION: pre_train — see its docstring and inline comments.
+def pre_train(args, loader, main_model, atom_model, main_optim, atom_optim, criterion, fabric: Fabric):  # Define this callable; its indented block implements the documented operation.
     """Run one masked-node reconstruction training epoch and return updated states."""
-    main_model.train(), atom_model.train()
-    main_optim.zero_grad(), atom_optim.zero_grad()
-    epoch_loss = torch.zeros(2).to(fabric.local_rank)
+    main_model.train(), atom_model.train()  # Switch the model to training behaviour.
+    main_optim.zero_grad(), atom_optim.zero_grad()  # Clear accumulated gradients before the next optimization update.
+    epoch_loss = torch.zeros(2).to(fabric.local_rank)  # Compute or store a loss, error, residual, or regression evaluation statistic.
 
-    for iteration, (graphs, lg, fg, _) in enumerate(loader):
+    for iteration, (graphs, lg, fg, _) in enumerate(loader):  # Iterate over the stated records, layers, batches, or graph elements.
 
-        is_accumulating = iteration % args.n_cum != 0
+        is_accumulating = iteration % args.n_cum != 0  # Bind this name to an intermediate value, configuration setting, or result.
 
-        g = graphs[0]
-        nsg = graphs[1]
-        node_idxs = nsg.ndata[dgl.NID].tolist()
+        g = graphs[0]  # Construct or transform graph topology, geometry, or molecular feature data.
+        nsg = graphs[1]  # Construct or transform graph topology, geometry, or molecular feature data.
+        node_idxs = nsg.ndata[dgl.NID].tolist()  # Construct or transform graph topology, geometry, or molecular feature data.
         node_truths = nsg.ndata['node_feats']
 
-        with fabric.no_backward_sync(main_model, enabled=is_accumulating), fabric.no_backward_sync(atom_model, enabled=is_accumulating):
-            _, node_rep, _, _, _ = main_model(g, lg, fg)
-            pred_node = atom_model(node_rep[node_idxs])
-            loss = criterion(pred_node, node_truths)
-            fabric.backward(loss)
+        with fabric.no_backward_sync(main_model, enabled=is_accumulating), fabric.no_backward_sync(atom_model, enabled=is_accumulating):  # Enter a managed context so resources and graph state are cleaned up safely.
+            _, node_rep, _, _, _ = main_model(g, lg, fg)  # Construct or transform graph topology, geometry, or molecular feature data.
+            pred_node = atom_model(node_rep[node_idxs])  # Construct or transform graph topology, geometry, or molecular feature data.
+            loss = criterion(pred_node, node_truths)  # Compute or store a loss, error, residual, or regression evaluation statistic.
+            fabric.backward(loss)  # Backpropagate the loss to compute gradients for trainable parameters.
 
-        if not is_accumulating:
-            main_optim.step()
-            main_optim.zero_grad()
-            atom_optim.step()
-            atom_optim.zero_grad()
+        if not is_accumulating:  # Evaluate this condition before executing the associated branch.
+            main_optim.step()  # Advance the optimizer or learning-rate scheduler by one update.
+            main_optim.zero_grad()  # Clear accumulated gradients before the next optimization update.
+            atom_optim.step()  # Advance the optimizer or learning-rate scheduler by one update.
+            atom_optim.zero_grad()  # Clear accumulated gradients before the next optimization update.
 
         # Save Loss
-        epoch_loss[0] += (loss.item() * args.n_cum)
-        epoch_loss[1] += args.batch_size
+        epoch_loss[0] += (loss.item() * args.n_cum)  # Compute or store a loss, error, residual, or regression evaluation statistic.
+        epoch_loss[1] += args.batch_size  # Compute or store a loss, error, residual, or regression evaluation statistic.
 
     fabric.all_reduce(epoch_loss, reduce_op='sum')
-    epoch_loss = epoch_loss[0] / epoch_loss[1]
+    epoch_loss = epoch_loss[0] / epoch_loss[1]  # Compute or store a loss, error, residual, or regression evaluation statistic.
     fabric.print('Epoch loss: %.4f' % epoch_loss)
-    return main_model, atom_model, main_optim, atom_optim, epoch_loss
+    return main_model, atom_model, main_optim, atom_optim, epoch_loss  # Return this computed tensor, metric, object, or collection to the caller.
 
 
-def validate(args, loader, main_model, atom_model, criterion, fabric):
+# FUNCTION: validate — see its docstring and inline comments.
+def validate(args, loader, main_model, atom_model, criterion, fabric):  # Define this callable; its indented block implements the documented operation.
     """Evaluate masked-node reconstruction loss and exact-vector accuracy."""
-    main_model.eval(), atom_model.eval()
-    epoch_loss = torch.zeros(2).to(fabric.local_rank)
-    epoch_matches = torch.empty(0).to(fabric.local_rank)
+    main_model.eval(), atom_model.eval()  # Switch the model to deterministic evaluation behaviour.
+    epoch_loss = torch.zeros(2).to(fabric.local_rank)  # Compute or store a loss, error, residual, or regression evaluation statistic.
+    epoch_matches = torch.empty(0).to(fabric.local_rank)  # Bind this name to an intermediate value, configuration setting, or result.
 
-    for graphs, lg, fg, _ in loader:
+    for graphs, lg, fg, _ in loader:  # Iterate over the stated records, layers, batches, or graph elements.
 
-        g = graphs[0]
-        nsg = graphs[1]
-        node_idxs = nsg.ndata[dgl.NID].tolist()
+        g = graphs[0]  # Construct or transform graph topology, geometry, or molecular feature data.
+        nsg = graphs[1]  # Construct or transform graph topology, geometry, or molecular feature data.
+        node_idxs = nsg.ndata[dgl.NID].tolist()  # Construct or transform graph topology, geometry, or molecular feature data.
         node_truths = nsg.ndata['node_feats']
 
-        with torch.no_grad():
-            _, node_rep, _, _, _ = main_model(g, lg, fg)
-            pred_node = atom_model(node_rep[node_idxs])
-            loss = criterion(pred_node, node_truths)
+        with torch.no_grad():  # Enter a managed context so resources and graph state are cleaned up safely.
+            _, node_rep, _, _, _ = main_model(g, lg, fg)  # Construct or transform graph topology, geometry, or molecular feature data.
+            pred_node = atom_model(node_rep[node_idxs])  # Construct or transform graph topology, geometry, or molecular feature data.
+            loss = criterion(pred_node, node_truths)  # Compute or store a loss, error, residual, or regression evaluation statistic.
 
         # Save Loss
-        epoch_loss[0] += (loss.item() * args.n_cum)
-        epoch_loss[1] += args.batch_size
+        epoch_loss[0] += (loss.item() * args.n_cum)  # Compute or store a loss, error, residual, or regression evaluation statistic.
+        epoch_loss[1] += args.batch_size  # Compute or store a loss, error, residual, or regression evaluation statistic.
 
         # Get accuracy of current iteration
-        pred_atoms = (torch.sigmoid(pred_node) > 0.5).float()
-        correct_atoms = torch.all(pred_atoms == node_truths, dim=1)
-        epoch_matches = torch.cat((epoch_matches, correct_atoms), dim=0)
+        pred_atoms = (torch.sigmoid(pred_node) > 0.5).float()  # Construct or transform graph topology, geometry, or molecular feature data.
+        correct_atoms = torch.all(pred_atoms == node_truths, dim=1)  # Construct or transform graph topology, geometry, or molecular feature data.
+        epoch_matches = torch.cat((epoch_matches, correct_atoms), dim=0)  # Bind this name to an intermediate value, configuration setting, or result.
 
     # Get overall accuracy accross all iterations
-    accuracy = epoch_matches.to(torch.float32).mean()
-    fabric.print(f'Validation accuracy: {accuracy}')
+    accuracy = epoch_matches.to(torch.float32).mean()  # Bind this name to an intermediate value, configuration setting, or result.
+    fabric.print(f'Validation accuracy: {accuracy}')  # Perform this step of the surrounding calculation or control-flow block.
 
     # Get overall loss and return it
     fabric.all_reduce(epoch_loss, reduce_op='sum')
-    epoch_loss = epoch_loss[0] / epoch_loss[1]
-    return epoch_loss, accuracy
+    epoch_loss = epoch_loss[0] / epoch_loss[1]  # Compute or store a loss, error, residual, or regression evaluation statistic.
+    return epoch_loss, accuracy  # Return this computed tensor, metric, object, or collection to the caller.
 
 
-def main(args):
+# FUNCTION: main — see its docstring and inline comments.
+def main(args):  # Define this callable; its indented block implements the documented operation.
 
     """Configure Fabric, datasets, models, optimizers and the pretraining loop."""
-    if not osp.exists(args.model_path):
-        os.makedirs(args.model_path)
+    if not osp.exists(args.model_path):  # Evaluate this condition before executing the associated branch.
+        os.makedirs(args.model_path)  # Perform this step of the surrounding calculation or control-flow block.
 
     # ------------------------------------- FABRIC SETUP -------------------------------------
-    logger = CSVLogger(
-        root_dir=args.save_dir,
-        name=args.run_name,
-        flush_logs_every_n_steps=1
-    )
-    policy = {encoder, EdgeGatedGraphConv, multiheaded}
+    logger = CSVLogger(  # Bind this name to an intermediate value, configuration setting, or result.
+        root_dir=args.save_dir,  # Bind this name to an intermediate value, configuration setting, or result.
+        name=args.run_name,  # Bind this name to an intermediate value, configuration setting, or result.
+        flush_logs_every_n_steps=1  # Bind this name to an intermediate value, configuration setting, or result.
+    )  # Continue or close the surrounding multiline expression or collection.
+    policy = {encoder, EdgeGatedGraphConv, multiheaded}  # Construct or transform graph topology, geometry, or molecular feature data.
     fsdp_strategy = FSDPStrategy(auto_wrap_policy=policy, activation_checkpointing_policy=policy, state_dict_type='full')
     if args.accelerator == 'cpu' or args.accelerator == 'mps':
-        fabric = Fabric(accelerator=args.accelerator, devices=args.n_devices, num_nodes=args.n_nodes, loggers=logger)
+        fabric = Fabric(accelerator=args.accelerator, devices=args.n_devices, num_nodes=args.n_nodes, loggers=logger)  # Construct or transform graph topology, geometry, or molecular feature data.
     elif args.accelerator == 'gpu' or args.accelerator == 'cuda':
-        fabric = Fabric(accelerator=args.accelerator, devices=args.n_devices, num_nodes=args.n_nodes, strategy=fsdp_strategy, loggers=logger)
-    else:
+        fabric = Fabric(accelerator=args.accelerator, devices=args.n_devices, num_nodes=args.n_nodes, strategy=fsdp_strategy, loggers=logger)  # Construct or transform graph topology, geometry, or molecular feature data.
+    else:  # Handle the remaining case not covered by earlier conditions.
         fabric = Fabric(accelerator='auto', devices=args.n_devices, num_nodes=args.n_nodes, loggers=logger)
-    fabric.launch()
+    fabric.launch()  # Perform this step of the surrounding calculation or control-flow block.
 
     # ------------------------------------- DATASET SETUP -------------------------------------
-    data = StructureDataset(args, transform=MaskAtom(
+    data = StructureDataset(args, transform=MaskAtom(  # Prepare dataset membership or batched data access for the experiment.
         num_atom_fea=args.num_atom_fea, node_feat_name='node_feats', mask_rate=args.mask_rate
-    ))
-    training_data, validation_data = torch.utils.data.random_split(data, [args.train_split, args.val_split])
-    training_loader = DataLoader(training_data, collate_fn=data.collate_pre, batch_size=args.batch_size, shuffle=True)
-    validation_loader = DataLoader(validation_data, collate_fn=data.collate_pre, batch_size=args.batch_size, shuffle=True)
-    training_loader, validation_loader = fabric.setup_dataloaders(training_loader), fabric.setup_dataloaders(validation_loader)
+    ))  # Continue or close the surrounding multiline expression or collection.
+    training_data, validation_data = torch.utils.data.random_split(data, [args.train_split, args.val_split])  # Prepare dataset membership or batched data access for the experiment.
+    training_loader = DataLoader(training_data, collate_fn=data.collate_pre, batch_size=args.batch_size, shuffle=True)  # Prepare dataset membership or batched data access for the experiment.
+    validation_loader = DataLoader(validation_data, collate_fn=data.collate_pre, batch_size=args.batch_size, shuffle=True)  # Prepare dataset membership or batched data access for the experiment.
+    training_loader, validation_loader = fabric.setup_dataloaders(training_loader), fabric.setup_dataloaders(validation_loader)  # Prepare dataset membership or batched data access for the experiment.
 
     # ------------------------------------- MODEL, OPTIMIZER AND LOSS/ERROR FUNCTION SETUP -------------------------------------
-    main_model = Graphformer(args=args)
-    main_model.freeze_pretrain()
-    atom_model = nn.Sequential(Linear(args.hidden_dims, args.num_atom_fea), nn.Sigmoid())
-    main_model, atom_model = fabric.setup_module(main_model), fabric.setup_module(atom_model)
+    main_model = Graphformer(args=args)  # Construct or transform graph topology, geometry, or molecular feature data.
+    main_model.freeze_pretrain()  # Perform this step of the surrounding calculation or control-flow block.
+    atom_model = nn.Sequential(Linear(args.hidden_dims, args.num_atom_fea), nn.Sigmoid())  # Create or apply a trainable neural-network component.
+    main_model, atom_model = fabric.setup_module(main_model), fabric.setup_module(atom_model)  # Create or apply a trainable neural-network component.
 
-    main_optim = optim.Adam(filter(lambda p: p.requires_grad, main_model.parameters()), lr=args.lr, weight_decay=args.decay)
-    atom_optim = optim.Adam(atom_model.parameters(), lr=args.lr, weight_decay=args.decay)
-    main_optim, atom_optim = fabric.setup_optimizers(main_optim), fabric.setup_optimizers(atom_optim)
+    main_optim = optim.Adam(filter(lambda p: p.requires_grad, main_model.parameters()), lr=args.lr, weight_decay=args.decay)  # Create or apply a trainable neural-network component.
+    atom_optim = optim.Adam(atom_model.parameters(), lr=args.lr, weight_decay=args.decay)  # Create or apply a trainable neural-network component.
+    main_optim, atom_optim = fabric.setup_optimizers(main_optim), fabric.setup_optimizers(atom_optim)  # Bind this name to an intermediate value, configuration setting, or result.
 
-    if args.load_model == 1:
+    if args.load_model == 1:  # Evaluate this condition before executing the associated branch.
         # Check if there are model checkpoints
-        pt_main_path = osp.join(args.model_path, f'mm_checkpoint.{args.begin_epoch}epochs.ckpt')
-        pt_atom_path = osp.join(args.model_path, f'am_checkpoint.{args.begin_epoch}epochs.ckpt')
-        assert osp.exists(pt_main_path) and osp.exists(pt_atom_path), f'No models checkpoint for epoch {args.begin_epoch} exist in path {str(args.model_path)}'
+        pt_main_path = osp.join(args.model_path, f'mm_checkpoint.{args.begin_epoch}epochs.ckpt')  # Create or apply a trainable neural-network component.
+        pt_atom_path = osp.join(args.model_path, f'am_checkpoint.{args.begin_epoch}epochs.ckpt')  # Create or apply a trainable neural-network component.
+        assert osp.exists(pt_main_path) and osp.exists(pt_atom_path), f'No models checkpoint for epoch {args.begin_epoch} exist in path {str(args.model_path)}'  # Enforce an invariant required by the following calculation.
         # Load models
         main_state = {'model': main_model, 'optim_state': main_optim}
-        fabric.load(pt_main_path, state=main_state)
+        fabric.load(pt_main_path, state=main_state)  # Bind this name to an intermediate value, configuration setting, or result.
         atom_state = {'node_model': atom_model, 'node_optim': atom_optim}
-        fabric.load(pt_atom_path, state=atom_state)
+        fabric.load(pt_atom_path, state=atom_state)  # Bind this name to an intermediate value, configuration setting, or result.
 
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss()  # Compute or store a loss, error, residual, or regression evaluation statistic.
 
     fabric.print('-------------------- Pre-Training Started --------------------', flush=True)
-    lowest_error = np.inf
-    per_epoch_times = []
-    start_time = time.time()
+    lowest_error = np.inf  # Compute or store a loss, error, residual, or regression evaluation statistic.
+    per_epoch_times = []  # Bind this name to an intermediate value, configuration setting, or result.
+    start_time = time.time()  # Bind this name to an intermediate value, configuration setting, or result.
 
-    for epoch in range(args.begin_epoch, args.epochs + 1):
+    for epoch in range(args.begin_epoch, args.epochs + 1):  # Iterate over the stated records, layers, batches, or graph elements.
         # -------------------- TRAINING --------------------
-        training_start_time = time.time()
-        main_model, atom_model, main_optim, atom_optim, epoch_loss = pre_train(args, training_loader, main_model, atom_model, main_optim, atom_optim, criterion, fabric)
-        fabric.print(f'Training time: {time.time() - training_start_time} seconds')
+        training_start_time = time.time()  # Bind this name to an intermediate value, configuration setting, or result.
+        main_model, atom_model, main_optim, atom_optim, epoch_loss = pre_train(args, training_loader, main_model, atom_model, main_optim, atom_optim, criterion, fabric)  # Compute or store a loss, error, residual, or regression evaluation statistic.
+        fabric.print(f'Training time: {time.time() - training_start_time} seconds')  # Perform this step of the surrounding calculation or control-flow block.
 
         # ------------------- VALIDATION -------------------
-        validation_start_time = time.time()
-        epoch_error, epoch_accuracy = validate(args, validation_loader, main_model, atom_model, criterion, fabric)
-        fabric.print(f'Validation time: {time.time() - validation_start_time} seconds')
+        validation_start_time = time.time()  # Bind this name to an intermediate value, configuration setting, or result.
+        epoch_error, epoch_accuracy = validate(args, validation_loader, main_model, atom_model, criterion, fabric)  # Compute or store a loss, error, residual, or regression evaluation statistic.
+        fabric.print(f'Validation time: {time.time() - validation_start_time} seconds')  # Perform this step of the surrounding calculation or control-flow block.
 
         # ------------------- LOG RESULTS ------------------
-        per_epoch_time = time.time() - training_start_time
+        per_epoch_time = time.time() - training_start_time  # Bind this name to an intermediate value, configuration setting, or result.
         fabric.print('Completed Epoch %d of %d in %.2f s' % (epoch, args.epochs, per_epoch_time), flush=True)
-        per_epoch_times.append(per_epoch_time)
+        per_epoch_times.append(per_epoch_time)  # Perform this step of the surrounding calculation or control-flow block.
 
         fabric.log_dict({'Pre-Training Loss': epoch_loss, 'Pre-Training Error': epoch_error, 'Pre-Training Accuracy': epoch_accuracy},  step=epoch)
 
         # ----------------- CHECKPOINT MODEL ---------------
-        if epoch % 10 == 0:
+        if epoch % 10 == 0:  # Evaluate this condition before executing the associated branch.
             main_state = {'model': main_model, 'optim_state': main_optim}
-            fabric.save(osp.join(args.model_path, f'mm_checkpoint.{epoch}epochs.ckpt'), main_state)
+            fabric.save(osp.join(args.model_path, f'mm_checkpoint.{epoch}epochs.ckpt'), main_state)  # Perform this step of the surrounding calculation or control-flow block.
             atom_state = {'node_model': atom_model, 'node_optim': atom_optim}
-            fabric.save(osp.join(args.model_path, f'am_checkpoint.{epoch}epochs.ckpt'), atom_state)
+            fabric.save(osp.join(args.model_path, f'am_checkpoint.{epoch}epochs.ckpt'), atom_state)  # Perform this step of the surrounding calculation or control-flow block.
 
         # ------------- SAVE LOWEST ERROR MODEL ------------
-        if epoch_error < lowest_error:
-            lowest_error = epoch_error
+        if epoch_error < lowest_error:  # Evaluate this condition before executing the associated branch.
+            lowest_error = epoch_error  # Compute or store a loss, error, residual, or regression evaluation statistic.
             main_state = {'model': main_model, 'optim_state': main_optim}
-            fabric.save(osp.join(args.model_path, args.pretrain_model), main_state)
+            fabric.save(osp.join(args.model_path, args.pretrain_model), main_state)  # Perform this step of the surrounding calculation or control-flow block.
 
-    fabric.print(f'Average per epoch time: {np.mean(per_epoch_times)} seconds, Total {args.epochs} epochs time: {time.time() - start_time} seconds')
+    fabric.print(f'Average per epoch time: {np.mean(per_epoch_times)} seconds, Total {args.epochs} epochs time: {time.time() - start_time} seconds')  # Perform this step of the surrounding calculation or control-flow block.
     fabric.print('-------------------- Pre-Training Finished --------------------')
 
 
@@ -242,19 +254,19 @@ if __name__ == "__main__":
     parser.add_argument('--residual', type=int, default=1, choices=[0, 1], help='whether to add residuality to the network or not (default: True)')
     parser.add_argument('--mask_rate', type=float, default=0.2, help='percentage of node to be masked (default: 0.2)')
 
-    args = parser.parse_args()
+    args = parser.parse_args()  # Bind this name to an intermediate value, configuration setting, or result.
 
-    args.residual = bool(args.residual)
-    args.periodic = bool(args.periodic)
-    args.process = bool(args.process)
+    args.residual = bool(args.residual)  # Compute or store a loss, error, residual, or regression evaluation statistic.
+    args.periodic = bool(args.periodic)  # Bind this name to an intermediate value, configuration setting, or result.
+    args.process = bool(args.process)  # Bind this name to an intermediate value, configuration setting, or result.
 
-    if args.save_dir is None:
+    if args.save_dir is None:  # Evaluate this condition before executing the associated branch.
         args.save_dir = osp.join(os.getcwd(), 'output', 'pre-train')
-        if not osp.exists(args.save_dir):
-            directory = pathlib.Path(args.save_dir)
-            directory.mkdir(parents=True, exist_ok=True)
+        if not osp.exists(args.save_dir):  # Evaluate this condition before executing the associated branch.
+            directory = pathlib.Path(args.save_dir)  # Bind this name to an intermediate value, configuration setting, or result.
+            directory.mkdir(parents=True, exist_ok=True)  # Bind this name to an intermediate value, configuration setting, or result.
 
-    if args.run_name is None:
-        args.run_name = f'{args.num_layers}_{args.n_mha}_{args.n_alignn}_{args.n_gnn}'
+    if args.run_name is None:  # Evaluate this condition before executing the associated branch.
+        args.run_name = f'{args.num_layers}_{args.n_mha}_{args.n_alignn}_{args.n_gnn}'  # Create or apply a trainable neural-network component.
 
-    main(args)
+    main(args)  # Perform this step of the surrounding calculation or control-flow block.
