@@ -5,7 +5,7 @@ of ligands in the OpenBind EV-A71 2A dataset. It uses Morgan fingerprints,
 molecular graphs and crystallographic ligand geometry, with optional
 atom-feature masking pretraining.
 
-The target is **experimental pKD**, `pKD = −log10(KD in mol/L)`, not pKa.
+The target is **experimental pKD**, `pKD = −log10(KD in mol/L)`.
 Only ligand information is used; protein coordinates and sequences are not inputs.
 
 This README explains how to install the dependencies, prepare the raw data,
