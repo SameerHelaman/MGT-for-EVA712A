@@ -672,6 +672,6 @@ their code or data.
 
 ## AI acknowledgement
 
-OpenAI Codex was used to assist with debugging and code annotation. All
+OpenAI Codex was used to assist with code generation & debugging and code annotation. All
 AI-assisted outputs were reviewed and verified by the author before being used
 in this project.
